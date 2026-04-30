@@ -9,6 +9,10 @@ class MyApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         // Initialize MercurySDK with the Application context
-        MercurySDK.init(this)
+        try {
+            MercurySDK.init(this)
+        } catch (t: Throwable) {
+            DebugLog.e("MyApplication", "MercurySDK initialization failed", t)
+        }
     }
 }

@@ -1534,11 +1534,9 @@ class MainActivity :
     }
 
     fun getLastLocation(): Pair<Double, Double>? {
-        return if (lastGpsLat != null && lastGpsLon != null) {
-            Pair(lastGpsLat!!, lastGpsLon!!)
-        } else {
-            null
-        }
+        val lat = lastGpsLat ?: return null
+        val lon = lastGpsLon ?: return null
+        return Pair(lat, lon)
     }
 
     private fun ensureGpsUpdates() {
@@ -1803,6 +1801,7 @@ class MainActivity :
                                         { reader ->
                                             // When an image is captured
                                             val image = reader.acquireLatestImage()
+                                                    ?: return@setOnImageAvailableListener
                                             try {
                                                 // Convert image to base64 for web upload
                                                 val buffer = image.planes[0].buffer
@@ -2043,7 +2042,8 @@ class MainActivity :
                                                                         null -> {
                                                                     val input =
                                                                             dualWebViewGroup
-                                                                                    .getDialogInput()!!
+                                                                                    .getDialogInput()
+                                                                                    ?: return@runOnUiThread
                                                                     val currentText =
                                                                             input.text.toString()
                                                                     val cursorPosition =
@@ -2334,23 +2334,24 @@ class MainActivity :
             if (groqAudioService == null) {
                 initializeGroqService()
             }
+            val service = groqAudioService ?: return@runOnUiThread
 
-            if (!groqAudioService!!.hasApiKey()) {
+            if (!service.hasApiKey()) {
                 showGroqKeyDialog()
                 return@runOnUiThread
             }
 
-            if (groqAudioService!!.isRecording()) {
+            if (service.isRecording()) {
                 // Stop listening
                 DebugLog.d("SpeechRecognition", "Stopping Groq recording")
-                groqAudioService?.stopRecording()
+                service.stopRecording()
                 setVoiceAssistantAudioRoute(false)
                 dualWebViewGroup.showToast("Processing...")
             } else {
                 // Start listening
                 DebugLog.d("SpeechRecognition", "Starting Groq recording")
                 setVoiceAssistantAudioRoute(true)
-                groqAudioService?.startRecording()
+                service.startRecording()
                 dualWebViewGroup.showToast("Listening...")
             }
         }
@@ -2450,7 +2451,7 @@ class MainActivity :
                 dualWebViewGroup.setLinkText(newText, cursorPosition + text.length)
             }
             dualWebViewGroup.getDialogInput() != null -> {
-                val input = dualWebViewGroup.getDialogInput()!!
+                val input = dualWebViewGroup.getDialogInput() ?: return
                 val currentText = input.text.toString()
                 val cursorPosition = input.selectionStart.coerceAtLeast(0)
                 val newText = StringBuilder(currentText).insert(cursorPosition, text).toString()
@@ -4071,8 +4072,10 @@ class MainActivity :
                                 view?.let { dualWebViewGroup.injectPageObservers(it) }
 
                                 // Inject location early so it's available before page JS runs
-                                if (lastGpsLat != null && lastGpsLon != null) {
-                                    dualWebViewGroup.injectLocation(lastGpsLat!!, lastGpsLon!!)
+                                val lat = lastGpsLat
+                                val lon = lastGpsLon
+                                if (lat != null && lon != null) {
+                                    dualWebViewGroup.injectLocation(lat, lon)
                                 }
                             } else if (url?.startsWith("about:blank") == true &&
                                             lastValidUrl != null
@@ -4103,8 +4106,10 @@ class MainActivity :
                                 dualWebViewGroup.reapplyWebFontSettings()
 
                                 // Inject last known location if available
-                                if (lastGpsLat != null && lastGpsLon != null) {
-                                    dualWebViewGroup.injectLocation(lastGpsLat!!, lastGpsLon!!)
+                                val lat = lastGpsLat
+                                val lon = lastGpsLon
+                                if (lat != null && lon != null) {
+                                    dualWebViewGroup.injectLocation(lat, lon)
                                 }
 
                                 // Restore media listeners and scrollbar logic from DualWebViewGroup
@@ -5103,7 +5108,7 @@ class MainActivity :
                     val grantedResources = mutableListOf<String>()
                     var audioGranted = false
                     permissions.forEachIndexed { index, permission ->
-                        if (grantResults[index] == PackageManager.PERMISSION_GRANTED) {
+                        if (grantResults.getOrNull(index) == PackageManager.PERMISSION_GRANTED) {
                             if (permission == Manifest.permission.RECORD_AUDIO) {
                                 grantedResources.add(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
                                 audioGranted = true
@@ -5367,10 +5372,19 @@ class MainActivity :
                 if (currentTime - lastFrameTime < MIN_FRAME_INTERVAL_MS) return
                 lastFrameTime = currentTime
 
-                val qx = event.values[0]
-                val qy = event.values[1]
-                val qz = event.values[2]
-                val qw = event.values[3]
+                val values = event.values
+                if (values.size < 3) return
+
+                val qx = values[0]
+                val qy = values[1]
+                val qz = values[2]
+                val qw =
+                        if (values.size >= 4) {
+                            values[3]
+                        } else {
+                            val wSquared = 1f - (qx * qx + qy * qy + qz * qz)
+                            if (wSquared > 0f) kotlin.math.sqrt(wSquared) else 0f
+                        }
                 val currentQuaternion = floatArrayOf(qw, qx, qy, qz)
 
                 // Initialize smoothed quaternion if needed
@@ -5615,7 +5629,7 @@ class MainActivity :
                 dualWebViewGroup.setLinkText(newText, cursorPosition + 1)
             }
             dualWebViewGroup.getDialogInput() != null -> {
-                val input = dualWebViewGroup.getDialogInput()!!
+                val input = dualWebViewGroup.getDialogInput() ?: return
                 val currentText = input.text.toString()
                 val cursorPosition = input.selectionStart
                 val newText = StringBuilder(currentText).insert(cursorPosition, key).toString()
@@ -5654,7 +5668,7 @@ class MainActivity :
                 }
             }
             dualWebViewGroup.getDialogInput() != null -> {
-                val input = dualWebViewGroup.getDialogInput()!!
+                val input = dualWebViewGroup.getDialogInput() ?: return
                 val currentText = input.text.toString()
                 val cursorPosition = input.selectionStart
                 if (cursorPosition > 0) {
@@ -6262,12 +6276,25 @@ class MainActivity :
             targetView.saveState(webViewState)
 
             val parcel = Parcel.obtain()
-            webViewState.writeToParcel(parcel, 0)
-            val serializedState = Base64.encodeToString(parcel.marshall(), Base64.DEFAULT)
-            parcel.recycle()
+            try {
+                webViewState.writeToParcel(parcel, 0)
+                val marshalledState = parcel.marshall()
+                val maxStateBytes = 500_000
+                if (marshalledState.size > maxStateBytes) {
+                    DebugLog.w(
+                            "WebViewDebug",
+                            "Skipping large WebView state (${marshalledState.size} bytes) ($reason)"
+                    )
+                    return
+                }
 
-            getSharedPreferences(prefsName, MODE_PRIVATE).edit {
-                putString(Constants.KEY_WEBVIEW_STATE, serializedState)
+                val serializedState = Base64.encodeToString(marshalledState, Base64.DEFAULT)
+
+                getSharedPreferences(prefsName, MODE_PRIVATE).edit {
+                    putString(Constants.KEY_WEBVIEW_STATE, serializedState)
+                }
+            } finally {
+                parcel.recycle()
             }
 
             DebugLog.d("WebViewDebug", "WebView state persisted successfully ($reason)")
