@@ -75,6 +75,8 @@ import com.ffalconxr.mercury.ipc.helpers.GPSIPCHelper
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.text.Normalizer
+import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.asin
@@ -268,6 +270,8 @@ class MainActivity :
 
     private val PERMISSIONS_REQUEST_CODE = 123
     private var pendingPermissionRequest: PermissionRequest? = null
+    private var pendingMicStartAfterPermission = false
+    private var pendingMicArmWakeRouting = true
     private var qrScanCallbackWebView: WebView? = null
     private var isQrScanInProgress = false
     private var pendingNativeQrStart = false
@@ -275,6 +279,7 @@ class MainActivity :
     private val defaultQrZoomRatio = 3.0
     private var audioManager: AudioManager? = null
     private var speechRecognizer: SpeechRecognizer? = null
+    private lateinit var credentialStore: CredentialStore
     private lateinit var cameraManager: CameraManager
     private var cameraDevice: CameraDevice? = null
     private var imageReader: ImageReader? = null
@@ -358,7 +363,6 @@ class MainActivity :
 
     private var sensorEventListener = createSensorEventListener()
     private var shouldResetInitialQuaternion = false
-    private var pendingDoubleTapAction = false
 
     private var ipcLauncher: Launcher? = null
     private var gpsUpdatesRegistered = false
@@ -367,18 +371,19 @@ class MainActivity :
     private var lastGpsRequestAt = 0L
     private val GPS_IDLE_TIMEOUT_MS = 60000L
 
-    private val doubleTapLock = Any()
-    private var isProcessingDoubleTap = false
-    private var lastDoubleTapStartTime = 0L
-    private val DOUBLE_TAP_CONFIRMATION_DELAY = 200L
-
-    // Triple tap detection for re-centering in anchored mode
+    // Tap sequence detection: triple tap for mode toggle/re-centering
     private var lastTapTime = 0L
     private var firstTapTime = 0L
     private var tapCount = 0
     private val TAP_INTERVAL = 400L // Max time between consecutive taps
     private val TRIPLE_TAP_DURATION = 800L // Max time for entire 3-tap sequence
     private var isTripleTapInProgress = false
+    private var suppressTouchDispatchUntil = 0L
+    private var pendingConversationFillText: String? = null
+    private var autoLoginAttemptedUrl: String? = null
+    private var wakeWordArmed = false
+    private var lastSpeechPreviewToastAt = 0L
+    private var awaitingSpeechReady = false
 
     private var settingsMenu: View? = null
 
@@ -572,7 +577,7 @@ class MainActivity :
                                 // Store the down event for potential tap
                                 potentialTapEvent = MotionEvent.obtain(e)
 
-                                // Triple tap detection for screen re-centering in anchored mode
+                                // Triple tap detection for mode toggle/re-centering
                                 val currentTime = e.eventTime
                                 if (currentTime - lastTapTime > TAP_INTERVAL) {
                                     DebugLog.d("TripleTapDebug", "Starting new tap sequence")
@@ -601,9 +606,8 @@ class MainActivity :
                                     doubleTapRunnable = null
 
                                     handler.removeCallbacksAndMessages(null)
-                                    synchronized(doubleTapLock) { pendingDoubleTapAction = false }
                                     isTripleTapInProgress = true
-                                    tapCount = 0
+                                    suppressTouchDispatchUntil = SystemClock.uptimeMillis() + 250L
 
                                     if (isAnchored) {
                                         // Reset translations to center the view
@@ -615,7 +619,7 @@ class MainActivity :
                                         ) // Reset translations and rotation
                                         dualWebViewGroup.showToast("Screen Re-centered")
                                     } else {
-                                        // Non-anchored triple tap: Toggle Scroll Mode
+                                        // Non-anchored triple tap: toggle scroll/cursor mode
                                         if (dualWebViewGroup.isInScrollMode()) {
                                             toggleCursorVisibility(forceShow = true)
                                             dualWebViewGroup.showToast("Cursor mode activated")
@@ -941,7 +945,6 @@ class MainActivity :
 
                                 // Don't handle single taps that are part of a triple tap sequence
                                 if (isTripleTapInProgress) {
-                                    isTripleTapInProgress = false
                                     return true
                                 }
 
@@ -1005,15 +1008,6 @@ class MainActivity :
                             }
 
                             override fun onDoubleTap(e: MotionEvent): Boolean {
-                                // Prevent double tap back navigation if keyboard is visible
-                                if (isKeyboardVisible) {
-                                    DebugLog.d(
-                                            "DoubleTapDebug",
-                                            "Double tap ignored because keyboard is visible"
-                                    )
-                                    return true // Consume the event so it doesn't propagate
-                                }
-
                                 // If this is part of a triple tap sequence (which just toggled
                                 // mode), ignore double tap
                                 if (isTripleTapInProgress) {
@@ -1024,119 +1018,12 @@ class MainActivity :
                                     return true
                                 }
 
-                                val isInScrollMode = dualWebViewGroup.isInScrollMode()
                                 DebugLog.d(
                                         "DoubleTapDebug",
-                                        """onDoubleTap called. isProcessingDoubleTap: $isProcessingDoubleTap, isInScrollMode: $isInScrollMode"""
+                                        "Double tap detected, starting voice listening"
                                 )
-
-                                if (isInScrollMode) {
-                                    DebugLog.d(
-                                            "DoubleTapDebug",
-                                            "Double tap ignored because in scroll mode"
-                                    )
-                                    return true
-                                }
-
-                                synchronized(doubleTapLock) {
-                                    // Safety check: Reset if flag has been stuck for too long
-                                    // (>500ms)
-                                    val currentTime = SystemClock.uptimeMillis()
-                                    if (isProcessingDoubleTap &&
-                                                    lastDoubleTapStartTime > 0 &&
-                                                    currentTime - lastDoubleTapStartTime > 500
-                                    ) {
-                                        DebugLog.d(
-                                                "DoubleTapDebug",
-                                                "Resetting stuck isProcessingDoubleTap flag"
-                                        )
-                                        isProcessingDoubleTap = false
-                                    }
-
-                                    if (isProcessingDoubleTap) {
-                                        DebugLog.d(
-                                                "DoubleTapDebug",
-                                                "Skipping - already processing double tap"
-                                        )
-                                        return true
-                                    }
-                                    isProcessingDoubleTap = true
-                                    lastDoubleTapStartTime = currentTime
-                                    pendingDoubleTapAction = true
-
-                                    // Calculate dynamic delay to ensure we wait until AFTER the
-                                    // triple tap window closes
-                                    val timeSinceFirstTap = SystemClock.uptimeMillis() - firstTapTime
-                                    val remainingTripleTapWindow =
-                                            TRIPLE_TAP_DURATION - timeSinceFirstTap
-
-                                    // Make sure we wait at least a small buffer after the window
-                                    // closes
-                                    // But cap the delay to avoid excessive waiting if the window is
-                                    // huge (though 800ms is reasonable)
-                                    val delay =
-                                            if (remainingTripleTapWindow > 0)
-                                                    remainingTripleTapWindow + 30
-                                            else DOUBLE_TAP_CONFIRMATION_DELAY
-
-                                    DebugLog.d(
-                                            "DoubleTapDebug",
-                                            "Scheduling double tap action. Delay: ${delay}ms (Window remaining: $remainingTripleTapWindow)"
-                                    )
-
-                                    doubleTapRunnable = Runnable {
-                                        synchronized(doubleTapLock) {
-                                            try {
-                                                // Final check for triple tap
-                                                if (isTripleTapInProgress) {
-                                                    DebugLog.d(
-                                                            "DoubleTapDebug",
-                                                            "Aborting double tap action - triple tap in progress"
-                                                    )
-                                                    return@Runnable
-                                                }
-
-                                                if (pendingDoubleTapAction) {
-                                                    DebugLog.d(
-                                                            "DoubleTapDebug",
-                                                            "Executing pending double tap action"
-                                                    )
-                                                    performDoubleTapBackNavigation()
-                                                }
-                                            } finally {
-                                                // Note: Do NOT reset tapCount/lastTapTime here
-                                                pendingDoubleTapAction = false
-                                                isProcessingDoubleTap = false
-                                                lastDoubleTapStartTime = 0L
-                                                doubleTapRunnable = null
-                                            }
-                                        }
-                                    }
-
-                                    handler.postDelayed(doubleTapRunnable!!, delay)
-                                }
-
+                                startNativeVoiceListening()
                                 return true
-                            }
-
-                            private fun performDoubleTapBackNavigation() {
-                                val isScreenMasked = dualWebViewGroup.isScreenMasked()
-                                val hasHistory = webView.canGoBack()
-
-                                DebugLog.d(
-                                        "DoubleTapDebug",
-                                        """Double tap confirmed. isScreenMasked=$isScreenMasked, isKeyboardVisible=$isKeyboardVisible, canGoBack=$hasHistory"""
-                                )
-
-                                if (!hasHistory) {
-                                    DebugLog.d(
-                                            "DoubleTapDebug",
-                                            "No history entry available for goBack()"
-                                    )
-                                    return
-                                }
-
-                                onNavigationBackPressed()
                             }
                         }
                 )
@@ -1410,6 +1297,13 @@ class MainActivity :
         val prefs = getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
         smoothnessLevel = prefs.getInt(Constants.KEY_ANCHOR_SMOOTHNESS, 40)
         updateSmoothnessFactors(smoothnessLevel)
+        credentialStore = CredentialStore(this)
+        // Seed credentials from build environment only when available and not already stored.
+        if (credentialStore.getEmail() == null &&
+                BuildConfig.LOGIN_EMAIL.isNotBlank() &&
+                BuildConfig.LOGIN_PASSWORD.isNotBlank()) {
+            credentialStore.saveCredentials(BuildConfig.LOGIN_EMAIL, BuildConfig.LOGIN_PASSWORD)
+        }
 
         // Note: isAnchored is already loaded earlier from BrowserPrefs
         DebugLog.d("AnchorDebug", "Anchored state (loaded earlier): $isAnchored")
@@ -1418,7 +1312,7 @@ class MainActivity :
         // Set initial cursor position
         // Make cursor visible
         cursorLeftView.visibility = View.VISIBLE
-        cursorRightView.visibility = View.VISIBLE
+        cursorRightView.visibility = View.GONE
         centerCursor(true)
 
         // Start in saved anchored mode state
@@ -1588,12 +1482,7 @@ class MainActivity :
     fun openUrlInNewTab(url: String) {
         if (!::dualWebViewGroup.isInitialized) return
         val formattedUrl = formatUrl(url)
-        val newWebView = dualWebViewGroup.createNewWindow()
-        if (dualWebViewGroup.isChatVisible()) {
-            closeChatOnNextPageStart = true
-            closeChatOnNextPageStartDeadlineMs = SystemClock.uptimeMillis() + 5000L
-        }
-        newWebView.loadUrl(formattedUrl)
+        webView.loadUrl(formattedUrl)
     }
 
     fun getActiveWebViewUrlOrNull(): String? {
@@ -1602,15 +1491,13 @@ class MainActivity :
     }
 
     override fun onBookmarkSelected(url: String) {
-        val formattedUrl =
-                when {
-                    // Check for file: protocol specifically
-                    url.startsWith("file:", ignoreCase = true) -> url
-                    url.startsWith("http://") || url.startsWith("https://") -> url
-                    url.contains(".") -> "https://$url"
-                    else -> "https://www.google.com/search?q=${Uri.encode(url)}"
-                }
-        webView.loadUrl(formattedUrl)
+        val formattedUrl = formatUrl(url)
+        val uri = Uri.parse(formattedUrl)
+        if (isAllowedInSingleAppMode(uri)) {
+            webView.loadUrl(formattedUrl)
+        } else {
+            dualWebViewGroup.showToast("Blocked outside AgentZ")
+        }
     }
 
     private fun handleMaskToggle() {
@@ -1945,6 +1832,15 @@ class MainActivity :
         }
     }
 
+    private fun isAllowedInSingleAppMode(uri: Uri): Boolean {
+        val scheme = uri.scheme?.lowercase() ?: return false
+        if (scheme == "about" || scheme == "data" || scheme == "blob" || scheme == "javascript") {
+            return true
+        }
+        if (scheme != "http" && scheme != "https") return false
+        return uri.host?.equals("agentz-demo.aizcorp.vn", ignoreCase = true) == true
+    }
+
     private fun isStreamingSite(url: String?): Boolean {
         if (url == null) return false
         val streamingDomains =
@@ -1967,11 +1863,7 @@ class MainActivity :
     }
 
     private fun initializeSpeechRecognition() {
-        // Check if speech recognition is available
-        val isAvailable = SpeechRecognizer.isRecognitionAvailable(this)
-        DebugLog.d("SpeechRecognition", "Recognition available: $isAvailable")
-
-        if (!isAvailable) {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             DebugLog.w("SpeechRecognition", "Speech recognition not available on this device")
             return
         }
@@ -1981,124 +1873,27 @@ class MainActivity :
                     SpeechRecognizer.createSpeechRecognizer(this).apply {
                         setRecognitionListener(
                                 object : RecognitionListener {
-                                    override fun onResults(results: Bundle?) {
-                                        isListeningForSpeech = false
-                                        results?.getStringArrayList(
-                                                        SpeechRecognizer.RESULTS_RECOGNITION
-                                                )
-                                                ?.let { matches ->
-                                                    if (matches.isNotEmpty()) {
-                                                        val text = matches[0]
-                                                        runOnUiThread {
-                                                            onShowKeyboardForEdit(text)
-                                                            // Handle inserting text based on what
-                                                            // input is focused
-                                                            val editFieldVisible =
-                                                                    dualWebViewGroup
-                                                                            .urlEditText
-                                                                            .visibility ==
-                                                                            View.VISIBLE
-
-                                                            when {
-                                                                dualWebViewGroup
-                                                                        .isBookmarksExpanded() &&
-                                                                        !editFieldVisible -> {
-                                                                    // Handle bookmark menu
-                                                                    // navigation - maybe search
-                                                                    // bookmarks?
-                                                                    // For now just toast or ignore
-                                                                }
-                                                                editFieldVisible -> {
-                                                                    // Handle any edit field input
-                                                                    // (URL or bookmark)
-                                                                    val currentText =
-                                                                            dualWebViewGroup
-                                                                                    .getCurrentLinkText()
-                                                                    val cursorPosition =
-                                                                            dualWebViewGroup
-                                                                                    .urlEditText
-                                                                                    .selectionStart
-                                                                    // Insert the text at cursor
-                                                                    // position
-                                                                    val newText =
-                                                                            StringBuilder(
-                                                                                            currentText
-                                                                                    )
-                                                                                    .insert(
-                                                                                            cursorPosition,
-                                                                                            text
-                                                                                    )
-                                                                                    .toString()
-
-                                                                    // Set text and move cursor
-                                                                    // after inserted text
-                                                                    dualWebViewGroup.setLinkText(
-                                                                            newText,
-                                                                            cursorPosition +
-                                                                                    text.length
-                                                                    )
-                                                                }
-                                                                dualWebViewGroup.getDialogInput() !=
-                                                                        null -> {
-                                                                    val input =
-                                                                            dualWebViewGroup
-                                                                                    .getDialogInput()
-                                                                                    ?: return@runOnUiThread
-                                                                    val currentText =
-                                                                            input.text.toString()
-                                                                    val cursorPosition =
-                                                                            input.selectionStart
-                                                                    val newText =
-                                                                            StringBuilder(
-                                                                                            currentText
-                                                                                    )
-                                                                                    .insert(
-                                                                                            cursorPosition,
-                                                                                            text
-                                                                                    )
-                                                                                    .toString()
-                                                                    input.setText(newText)
-                                                                    input.setSelection(
-                                                                            cursorPosition +
-                                                                                    text.length
-                                                                    )
-                                                                }
-                                                                else -> {
-                                                                    sendTextToWebView(text)
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                    }
-
-                                    // Implement other RecognitionListener methods with empty bodies
                                     override fun onReadyForSpeech(params: Bundle?) {
-                                        DebugLog.d("SpeechRecognition", "Ready for speech")
-                                        dualWebViewGroup.showToast("Listening...")
+                                        isListeningForSpeech = true
+                                        awaitingSpeechReady = false
+                                        dualWebViewGroup.showToast("Listening... speak now")
                                     }
-                                    override fun onBeginningOfSpeech() {
-                                        DebugLog.d("SpeechRecognition", "Speech started")
-                                    }
+
+                                    override fun onBeginningOfSpeech() {}
+
                                     override fun onRmsChanged(rmsdB: Float) {}
+
                                     override fun onBufferReceived(buffer: ByteArray?) {}
+
                                     override fun onEndOfSpeech() {
-                                        DebugLog.d("SpeechRecognition", "Speech ended")
                                         isListeningForSpeech = false
                                     }
+
                                     override fun onError(error: Int) {
                                         isListeningForSpeech = false
+                                        awaitingSpeechReady = false
                                         val errorMsg =
                                                 when (error) {
-                                                    SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
-                                                            "Network timeout"
-                                                    SpeechRecognizer.ERROR_NETWORK ->
-                                                            "Network error"
-                                                    SpeechRecognizer.ERROR_AUDIO ->
-                                                            "Audio recording error"
-                                                    SpeechRecognizer.ERROR_SERVER -> "Server error"
-                                                    SpeechRecognizer.ERROR_CLIENT ->
-                                                            "Speech service unavailable"
                                                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
                                                             "No speech detected"
                                                     SpeechRecognizer.ERROR_NO_MATCH ->
@@ -2108,17 +1903,52 @@ class MainActivity :
                                                     SpeechRecognizer
                                                             .ERROR_INSUFFICIENT_PERMISSIONS ->
                                                             "Permission denied"
-                                                    else -> "Error: $error"
+                                                    else -> "Voice error ($error)"
                                                 }
-                                        DebugLog.e("SpeechRecognition", "Error: $error ($errorMsg)")
                                         dualWebViewGroup.showToast(errorMsg)
                                     }
-                                    override fun onPartialResults(partialResults: Bundle?) {}
+
+                                    override fun onResults(results: Bundle?) {
+                                        isListeningForSpeech = false
+                                        awaitingSpeechReady = false
+                                        val text =
+                                                results?.getStringArrayList(
+                                                                SpeechRecognizer.RESULTS_RECOGNITION
+                                                        )
+                                                        ?.firstOrNull()
+                                                        ?.trim()
+                                                        .orEmpty()
+                                        if (text.isNotBlank()) {
+                                            runOnUiThread {
+                                                val displayText =
+                                                        if (text.length > 80) "${text.take(77)}..." else text
+                                                dualWebViewGroup.showToast("You said: $displayText")
+                                                handleVoiceResult(text)
+                                            }
+                                        }
+                                    }
+
+                                    override fun onPartialResults(partialResults: Bundle?) {
+                                        val partialText =
+                                                partialResults?.getStringArrayList(
+                                                                SpeechRecognizer.RESULTS_RECOGNITION
+                                                        )
+                                                        ?.firstOrNull()
+                                                        ?.trim()
+                                                        .orEmpty()
+                                        if (partialText.isBlank()) return
+                                        val now = SystemClock.uptimeMillis()
+                                        if (now - lastSpeechPreviewToastAt < 450L) return
+                                        lastSpeechPreviewToastAt = now
+                                        val preview =
+                                                if (partialText.length > 60) "${partialText.take(57)}..." else partialText
+                                        dualWebViewGroup.showToast("Hearing: $preview")
+                                    }
+
                                     override fun onEvent(eventType: Int, params: Bundle?) {}
                                 }
                         )
                     }
-            DebugLog.d("SpeechRecognition", "SpeechRecognizer created successfully")
         } catch (e: Exception) {
             DebugLog.e("SpeechRecognition", "Failed to create SpeechRecognizer", e)
             speechRecognizer = null
@@ -2284,8 +2114,14 @@ class MainActivity :
     }
 
     private var isListeningForSpeech = false
-    private var groqAudioService: GroqAudioService? = null
     private var lastMicPressTime = 0L
+    private val dashboardRouteUrl = "https://agentz-demo.aizcorp.vn/cognition/dashboards"
+    private val conversationRouteUrl = "https://agentz-demo.aizcorp.vn/assistant/conversations"
+    private val wakeWordPattern = Regex("""(?i)\bhey\s*aiz\b""")
+    private val conversationPayloadPrefixPattern =
+            Regex(
+                    """(?i)^\s*(hey\s*aiz\s*)?(open|go\s*to|change\s*to|show|mở|mo|chuyển\s*sang|chuyen\s*sang|đi\s*đến|di\s*den)?\s*(conversation|conversations|chat|hội\s*thoại|hoi\s*thoai|cuộc\s*trò\s*chuyện|cuoc\s*tro\s*chuyen)\s*[:,-]?\s*"""
+            )
 
     private fun setVoiceAssistantAudioRoute(enabled: Boolean) {
         val value = if (enabled) "voiceassistant" else "off"
@@ -2303,10 +2139,6 @@ class MainActivity :
         }
     }
 
-    fun prepareAudioForTtsPlayback() {
-        runOnUiThread { setVoiceAssistantAudioRoute(true) }
-    }
-
     override fun onMicrophonePressed() {
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastMicPressTime < 500) {
@@ -2319,121 +2151,108 @@ class MainActivity :
                 "SpeechRecognition",
                 "onMicrophonePressed called, isListening: $isListeningForSpeech"
         )
+        // Keyboard mic is for text input, not wake/routing
+        startNativeVoiceListening(armWakeRouting = false)
+    }
+
+    private fun startNativeVoiceListening(armWakeRouting: Boolean = true) {
         runOnUiThread {
+            dualWebViewGroup.showToast("Voice trigger received")
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
                             PackageManager.PERMISSION_GRANTED
             ) {
-                DebugLog.d("SpeechRecognition", "Requesting audio permission")
+                dualWebViewGroup.showToast("Microphone permission required")
+                pendingMicStartAfterPermission = true
+                pendingMicArmWakeRouting = armWakeRouting
                 requestPermissions(
                         arrayOf(Manifest.permission.RECORD_AUDIO),
                         PERMISSIONS_REQUEST_CODE
                 )
                 return@runOnUiThread
             }
-
-            if (groqAudioService == null) {
-                initializeGroqService()
+            if (!::dualWebViewGroup.isInitialized || speechRecognizer == null) {
+                initializeSpeechRecognition()
             }
-            val service = groqAudioService ?: return@runOnUiThread
-
-            if (!service.hasApiKey()) {
-                showGroqKeyDialog()
+            if (speechRecognizer == null) {
+                dualWebViewGroup.showToast("Speech recognition unavailable")
                 return@runOnUiThread
             }
-
-            if (service.isRecording()) {
-                // Stop listening
-                DebugLog.d("SpeechRecognition", "Stopping Groq recording")
-                service.stopRecording()
-                setVoiceAssistantAudioRoute(false)
-                dualWebViewGroup.showToast("Processing...")
-            } else {
-                // Start listening
-                DebugLog.d("SpeechRecognition", "Starting Groq recording")
+            wakeWordArmed = armWakeRouting
+            try {
+                val preferredLanguage = Locale.getDefault().toLanguageTag().ifBlank { "en-US" }
                 setVoiceAssistantAudioRoute(true)
-                service.startRecording()
-                dualWebViewGroup.showToast("Listening...")
+                awaitingSpeechReady = true
+                isListeningForSpeech = false
+                dualWebViewGroup.showToast("Starting voice listener...")
+                speechRecognizer?.cancel()
+                speechRecognizer?.startListening(
+                        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(
+                                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                            )
+                            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, preferredLanguage)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, preferredLanguage)
+                            // Keep both common command languages available for recognition.
+                            putExtra(
+                                    "android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES",
+                                    arrayOf("en-US", "vi-VN")
+                            )
+                            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                        }
+                )
+                Handler(Looper.getMainLooper()).postDelayed(
+                        {
+                            if (awaitingSpeechReady && !isListeningForSpeech) {
+                                awaitingSpeechReady = false
+                                dualWebViewGroup.showToast("Recognizer not ready. Check mic/audio route.")
+                            }
+                        },
+                        1800
+                )
+                pendingMicStartAfterPermission = false
+            } catch (e: Exception) {
+                DebugLog.e("SpeechRecognition", "Failed to start native listening", e)
+                dualWebViewGroup.showToast("Unable to start listening")
+                isListeningForSpeech = false
+                awaitingSpeechReady = false
+                pendingMicStartAfterPermission = false
             }
         }
-    }
-
-    fun showGroqKeyDialog() {
-        if (groqAudioService == null) {
-            initializeGroqService()
-        }
-        val currentKey = groqAudioService?.getApiKey()
-        dualWebViewGroup.showPromptDialog(
-                "Enter Groq API Key",
-                currentKey,
-                { key ->
-                    groqAudioService?.setApiKey(key)
-                    dualWebViewGroup.showToast("API Key Saved")
-                    hideCustomKeyboard()
-                },
-                { dualWebViewGroup.showToast("API Key Required for Voice") }
-        )
-    }
-
-    private fun initializeGroqService() {
-        groqAudioService =
-                GroqAudioService(this).apply {
-                    setListener(
-                            object : GroqAudioService.TranscriptionListener {
-                                override fun onTranscriptionResult(text: String) {
-                                    DebugLog.d("SpeechRecognition", "Groq result: $text")
-                                    runOnUiThread {
-                                        // Restore playback route after recording so chat TTS is
-                                        // audible.
-                                        setVoiceAssistantAudioRoute(true)
-                                        // If chat is visible, insert text there
-                                        if (dualWebViewGroup.isChatVisible()) {
-                                            dualWebViewGroup.insertVoiceToChatInput(text)
-                                        } else {
-                                            handleVoiceResult(text)
-                                        }
-                                        dualWebViewGroup.showToast("Success")
-                                        keyboardView?.setMicActive(false)
-                                        dualWebViewGroup.setChatMicActive(false)
-                                    }
-                                }
-
-                                override fun onError(message: String) {
-                                    DebugLog.e("SpeechRecognition", "Groq error: $message")
-                                    runOnUiThread {
-                                        setVoiceAssistantAudioRoute(false)
-                                        dualWebViewGroup.showToast("Voice Error: $message")
-                                        keyboardView?.setMicActive(false)
-                                        dualWebViewGroup.setChatMicActive(false)
-                                        if (message.contains("No API Key")) {
-                                            showGroqKeyDialog()
-                                        }
-                                    }
-                                }
-
-                                override fun onRecordingStart() {
-                                    DebugLog.d("SpeechRecognition", "Groq recording started")
-                                    runOnUiThread {
-                                        isListeningForSpeech = true
-                                        keyboardView?.setMicActive(true)
-                                        dualWebViewGroup.setChatMicActive(true)
-                                    }
-                                }
-
-                                override fun onRecordingStop() {
-                                    DebugLog.d("SpeechRecognition", "Groq recording stopped")
-                                    runOnUiThread {
-                                        isListeningForSpeech = false
-                                        // Don't turn off mic indicator yet, wait for processing
-                                        // result
-                                    }
-                                }
-                            }
-                    )
-                }
     }
 
     private fun handleVoiceResult(text: String) {
         if (text.isBlank()) return
+
+        val trimmed = text.trim()
+        val normalized = normalizeVoiceText(trimmed)
+        val wakeWordOnly =
+                wakeWordPattern.containsMatchIn(trimmed) &&
+                        !containsRouteKeyword(normalized.removePrefix("hey aiz").trim())
+        if (wakeWordOnly) {
+            dualWebViewGroup.showToast("Wake word detected")
+            startNativeVoiceListening()
+            return
+        }
+
+        val route = resolveRouteFromCommand(normalized)
+        if (route == conversationRouteUrl) {
+            pendingConversationFillText = extractConversationPayload(trimmed)
+            webView.loadUrl(conversationRouteUrl)
+            wakeWordArmed = false
+            return
+        }
+        if (route == dashboardRouteUrl) {
+            webView.loadUrl(dashboardRouteUrl)
+            wakeWordArmed = false
+            return
+        }
+        if (wakeWordArmed) {
+            dualWebViewGroup.showToast("No route matched")
+            wakeWordArmed = false
+            return
+        }
 
         onShowKeyboardForEdit(text)
         val editFieldVisible = dualWebViewGroup.urlEditText.visibility == View.VISIBLE
@@ -2462,8 +2281,40 @@ class MainActivity :
                 sendTextToWebView(text)
             }
         }
+    }
 
-        isListeningForSpeech = false
+    private fun normalizeVoiceText(text: String): String {
+        val lower = text.lowercase().trim()
+        val decomposed = Normalizer.normalize(lower, Normalizer.Form.NFD)
+        return decomposed
+                .replace(Regex("\\p{M}+"), "")             // strip combining diacritics
+                .replace(Regex("[^\\p{L}\\p{N}\\s]"), " ") // strip non-letter/digit/space
+                .replace(Regex("\\s+"), " ")
+                .trim()
+    }
+
+    private fun containsRouteKeyword(normalized: String): Boolean {
+        val dashboardKeywords = listOf("dashboard", "bang dieu khien")
+        val conversationKeywords =
+                listOf("conversation", "conversations", "chat", "hoi thoai", "cuoc tro chuyen")
+        return dashboardKeywords.any { normalized.contains(it) } ||
+                conversationKeywords.any { normalized.contains(it) }
+    }
+
+    private fun resolveRouteFromCommand(normalized: String): String? {
+        if (normalized.isBlank()) return null
+        val command = normalized.removePrefix("hey aiz").trim()
+        val dashboardKeywords = listOf("dashboard", "bang dieu khien")
+        if (dashboardKeywords.any { command.contains(it) }) return dashboardRouteUrl
+        val conversationKeywords =
+                listOf("conversation", "conversations", "chat", "hoi thoai", "cuoc tro chuyen")
+        if (conversationKeywords.any { command.contains(it) }) return conversationRouteUrl
+        return null
+    }
+
+    private fun extractConversationPayload(rawText: String): String? {
+        val value = rawText.replace(conversationPayloadPrefixPattern, "").trim()
+        return value.takeIf { it.isNotBlank() }
     }
 
     private fun moveCursor(offset: Int) {
@@ -3887,53 +3738,17 @@ class MainActivity :
 
         // Section 1: Basic WebView Configuration
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
-        webView.addJavascriptInterface(WebAppInterface(this, webView), "GroqBridge")
-
-        // Intercept taplink://chat URLs
         webView.webViewClient =
                 object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
                             view: WebView?,
                             request: WebResourceRequest?
                     ): Boolean {
-                        val url = request?.url?.toString() ?: return false
-                        DebugLog.d("MainActivityClient", "Checking URL: $url")
-
-                        if (url.startsWith("taplink://chat")) {
-                            DebugLog.d("MainActivityClient", "Intercepted taplink://chat")
-                            val uri = android.net.Uri.parse(url)
-                            val msg = uri.getQueryParameter("msg")
-                            val history = uri.getQueryParameter("history")
-
-                            if (msg != null && view != null) {
-                                val webInterface =
-                                        com.TapLinkX3.app.WebAppInterface(this@MainActivity, view)
-                                webInterface.chatWithGroq(msg, history ?: "[]")
-                            }
-                            return true
-                        }
                         return false
                     }
 
                     @Deprecated("Deprecated in Java")
                     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                        DebugLog.d("MainActivityClient", "Checking URL (deprecated): $url")
-                        if (url != null && url.startsWith("taplink://chat")) {
-                            DebugLog.d(
-                                    "MainActivityClient",
-                                    "Intercepted taplink://chat (deprecated)"
-                            )
-                            val uri = android.net.Uri.parse(url)
-                            val msg = uri.getQueryParameter("msg")
-                            val history = uri.getQueryParameter("history")
-
-                            if (msg != null && view != null) {
-                                val webInterface =
-                                        com.TapLinkX3.app.WebAppInterface(this@MainActivity, view)
-                                webInterface.chatWithGroq(msg, history ?: "[]")
-                            }
-                            return true
-                        }
                         return false
                     }
                 }
@@ -4019,6 +3834,17 @@ class MainActivity :
                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                             super.onPageStarted(view, url, favicon)
                             DebugLog.d("WebViewDebug", "Page started loading: $url")
+                            // shouldOverrideUrlLoading is the primary gate for external URLs.
+                            // Stopping inside onPageStarted and re-loading DEFAULT_URL can cause
+                            // recursive onPageStarted calls on some devices, so we only log here.
+                            if (url != null &&
+                                            !url.startsWith("about:blank") &&
+                                            !isAllowedInSingleAppMode(Uri.parse(url))
+                            ) {
+                                DebugLog.w("SingleAppMode", "onPageStarted: unexpected external URL slipped through: $url")
+                                view?.stopLoading()
+                                return
+                            }
 
                             if (closeChatOnNextPageStart) {
                                 val now = SystemClock.uptimeMillis()
@@ -4101,6 +3927,8 @@ class MainActivity :
                             if (url != null && !url.startsWith("about:blank")) {
                                 view?.visibility = View.VISIBLE
                                 injectJavaScriptForInputFocus()
+                                maybePerformAutoLogin(view, url)
+                                maybeInjectPendingConversationInput(view, url)
 
                                 // Re-apply saved font settings to new page
                                 dualWebViewGroup.reapplyWebFontSettings()
@@ -4127,7 +3955,7 @@ class MainActivity :
                                     if (lastPlayingState !== isPlaying) {
                                         console.log('[TapLink] Media state changed:', isPlaying);
                                         lastPlayingState = isPlaying;
-                                        var bridge = window.GroqBridge || window.Android;
+                                        var bridge = window.AndroidInterface;
                                         if (bridge && typeof bridge.onMediaPlaying === 'function') {
                                             bridge.onMediaPlaying(isPlaying);
                                         } else {
@@ -4236,58 +4064,9 @@ class MainActivity :
                                 request: WebResourceRequest?
                         ): Boolean {
                             val uri = request?.url ?: return false
-                            val url = uri.toString()
-
-                            // Block about:blank navigations
-                            if (url.startsWith("about:blank")) {
-                                return true
-                            }
-
-                            val scheme = uri.scheme?.lowercase()
-
-                            // Handle app intents
-                            if (scheme == "intent" || scheme == "market") {
-                                val fallbackUrl =
-                                        url.substringAfter("fallback_url=", "")
-                                                .substringBefore("#", "")
-                                                .substringBefore("&", "")
-
-                                if (fallbackUrl.isNotEmpty() &&
-                                                (fallbackUrl.startsWith("http") ||
-                                                        fallbackUrl.startsWith("https"))
-                                ) {
-                                    view?.loadUrl(fallbackUrl)
-                                    return true
-                                }
-                                return true
-                            }
-
-                            // Let WebView handle schemes it natively understands
-                            if (scheme == null ||
-                                            scheme == "http" ||
-                                            scheme == "https" ||
-                                            scheme == "file" ||
-                                            scheme == "about" ||
-                                            scheme == "data" ||
-                                            scheme == "blob" ||
-                                            scheme == "javascript"
-                            ) {
-                                return false
-                            }
-
-                            // For app/deep-link schemes (e.g., TikTok snssdk1233://), try external
-                            return try {
-                                val intent = Intent(Intent.ACTION_VIEW, uri)
-                                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                startActivity(intent)
-                                true
-                            } catch (e: ActivityNotFoundException) {
-                                DebugLog.w("WebView", "No handler for URL scheme: $scheme ($url)")
-                                true
-                            } catch (e: Exception) {
-                                DebugLog.w("WebView", "Failed to open external URL: $url")
-                                true
-                            }
+                            if (isAllowedInSingleAppMode(uri)) return false
+                            DebugLog.d("SingleAppMode", "Blocked navigation: ${uri}")
+                            return true
                         }
                     }
             // Add more detailed logging to track input field interactions
@@ -4526,14 +4305,6 @@ class MainActivity :
                                 isUserGesture: Boolean,
                                 resultMsg: android.os.Message?
                         ): Boolean {
-                            // Must provide a pristine WebView here; Chromium will navigate it.
-                            val newWebView = dualWebViewGroup.createNewWindow(loadDefaultUrl = false)
-                            val transport = resultMsg?.obj as? WebView.WebViewTransport
-                            if (transport != null) {
-                                transport.webView = newWebView
-                                resultMsg.sendToTarget()
-                                return true
-                            }
                             return false
                         }
                     }
@@ -4562,7 +4333,7 @@ class MainActivity :
             databaseEnabled = true
             useWideViewPort = true
             loadWithOverviewMode = true
-            setSupportMultipleWindows(true)
+            setSupportMultipleWindows(false)
         }
 
         logPermissionState() // Log initial permission state
@@ -4620,7 +4391,10 @@ class MainActivity :
             }
 
             if (!restored) {
-                if (lastUrl != null && !lastUrl.startsWith("about:blank")) {
+                if (lastUrl != null &&
+                                !lastUrl.startsWith("about:blank") &&
+                                isAllowedInSingleAppMode(Uri.parse(lastUrl))
+                ) {
                     DebugLog.d("WebViewDebug", "Loading saved URL: $lastUrl")
                     webView.loadUrl(lastUrl)
                 } else {
@@ -4647,38 +4421,95 @@ class MainActivity :
         }
     }
 
-    private class WebAppInterface(
-            private val activity: MainActivity,
-            private val webView: WebView
-    ) {
-        @JavascriptInterface
-        fun onInputFocus() {
-            activity.runOnUiThread {
-                // Double check that we're not already showing the keyboard
-                if (!activity.isKeyboardVisible) {
-                    activity.showCustomKeyboard()
-                }
-            }
+    private fun maybePerformAutoLogin(targetWebView: WebView?, url: String) {
+        if (targetWebView == null) return
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return
+        if (!isAllowedInSingleAppMode(uri)) return
+        val path = uri.path?.lowercase().orEmpty()
+        val isLoginPage = path.contains("login") || path.contains("sign-in") || path.contains("signin")
+        if (!isLoginPage) {
+            // Clear the guard when leaving the login page so re-login works after logout
+            autoLoginAttemptedUrl = null
+            return
         }
+        if (autoLoginAttemptedUrl == url) return
 
-        @JavascriptInterface
-        fun onMediaPlaying(isPlaying: Boolean) {
-            activity.runOnUiThread {
-                if (activity.dualWebViewGroup.isActiveWebView(webView)) {
-                    activity.dualWebViewGroup.updateMediaState(isPlaying)
-                    if (isPlaying) {
-                        activity.dualWebViewGroup.pauseBackgroundMedia(webView)
+        val email = credentialStore.getEmail() ?: return
+        val password = credentialStore.getPassword() ?: return
+        autoLoginAttemptedUrl = url
+
+        targetWebView.evaluateJavascript(
+                """
+            (function() {
+                var emailEl = document.querySelector('#login-email');
+                var passEl = document.querySelector('#login-password');
+                var buttonEl = document.querySelector('#login-button');
+                if (!emailEl || !passEl || !buttonEl) return 'missing-selectors';
+
+                function setValue(el, value) {
+                    var proto = Object.getPrototypeOf(el);
+                    var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (descriptor && descriptor.set) {
+                        descriptor.set.call(el, value);
+                    } else {
+                        el.value = value;
                     }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
                 }
-            }
-        }
 
-        @JavascriptInterface
-        fun onMediaDetected(hasMedia: Boolean) {
-            activity.runOnUiThread {
-                if (!hasMedia && activity.dualWebViewGroup.isActiveWebView(webView)) {
-                    activity.dualWebViewGroup.hideMediaControls()
+                setValue(emailEl, ${JSONObject.quote(email)});
+                setValue(passEl, ${JSONObject.quote(password)});
+                buttonEl.click();
+                return 'submitted';
+            })();
+        """,
+                null
+        )
+    }
+
+    private fun maybeInjectPendingConversationInput(targetWebView: WebView?, url: String) {
+        if (targetWebView == null) return
+        if (!url.startsWith(conversationRouteUrl, ignoreCase = true)) return
+        val pending = pendingConversationFillText ?: return
+        val trimmed = pending.trim()
+        if (trimmed.isBlank()) {
+            pendingConversationFillText = null
+            return
+        }
+        // Clear immediately so repeated onPageFinished calls don't re-inject
+        pendingConversationFillText = null
+        // SPA chat textarea may not be rendered right at onPageFinished; retry with delays
+        val js = """
+            (function() {
+                var input = document.querySelector('#chat-message-textarea');
+                if (!input) return 'missing-chat-input';
+                input.focus();
+                var proto = Object.getPrototypeOf(input);
+                var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (descriptor && descriptor.set) {
+                    descriptor.set.call(input, ${JSONObject.quote(trimmed)});
+                } else {
+                    input.value = ${JSONObject.quote(trimmed)};
                 }
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'filled';
+            })();
+        """.trimIndent()
+        // First attempt immediately after page finished
+        targetWebView.evaluateJavascript(js) { result ->
+            if (result?.contains("missing-chat-input") == true) {
+                // Textarea not ready yet; retry after 800 ms then 2 s
+                targetWebView.postDelayed({
+                    targetWebView.evaluateJavascript(js) { r2 ->
+                        if (r2?.contains("missing-chat-input") == true) {
+                            targetWebView.postDelayed({
+                                targetWebView.evaluateJavascript(js, null)
+                            }, 1200)
+                        }
+                    }
+                }, 800)
             }
         }
     }
@@ -4805,7 +4636,9 @@ class MainActivity :
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         cursorLeftView.visibility = if (isCursorVisible) View.VISIBLE else View.GONE
-        cursorRightView.visibility = if (isCursorVisible) View.VISIBLE else View.GONE
+        // Right eye already mirrors left-eye content via PixelCopy; keeping an explicit right cursor
+        // causes a duplicate cursor on the right display.
+        cursorRightView.visibility = View.GONE
 
         customViewCallback?.onCustomViewHidden()
         customViewCallback = null
@@ -5104,9 +4937,9 @@ class MainActivity :
 
         when (requestCode) {
             PERMISSIONS_REQUEST_CODE -> {
+                var audioGranted = false
                 pendingPermissionRequest?.let { request ->
                     val grantedResources = mutableListOf<String>()
-                    var audioGranted = false
                     permissions.forEachIndexed { index, permission ->
                         if (grantResults.getOrNull(index) == PackageManager.PERMISSION_GRANTED) {
                             if (permission == Manifest.permission.RECORD_AUDIO) {
@@ -5127,6 +4960,25 @@ class MainActivity :
                         request.deny()
                     }
                     pendingPermissionRequest = null
+                }
+
+                permissions.forEachIndexed { index, permission ->
+                    if (permission == Manifest.permission.RECORD_AUDIO &&
+                                    grantResults.getOrNull(index) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        audioGranted = true
+                    }
+                }
+
+                if (pendingMicStartAfterPermission) {
+                    if (audioGranted) {
+                        val armWakeRouting = pendingMicArmWakeRouting
+                        pendingMicStartAfterPermission = false
+                        startNativeVoiceListening(armWakeRouting = armWakeRouting)
+                    } else {
+                        pendingMicStartAfterPermission = false
+                        dualWebViewGroup.showToast("Microphone permission denied")
+                    }
                 }
             }
             CAMERA_PERMISSION_CODE -> {
@@ -5563,6 +5415,10 @@ class MainActivity :
     override fun onCursorPositionChanged(x: Float, y: Float, isVisible: Boolean) {
         val scale = dualWebViewGroup.uiScale
         val shouldRenderCursor = isVisible && !isMouseTapMode
+        val baseCursorWidth = (cursorLeftView.layoutParams?.width ?: 24).toFloat()
+        val baseCursorHeight = (cursorLeftView.layoutParams?.height ?: 24).toFloat()
+        val scaledCursorWidth = baseCursorWidth * scale
+        val scaledCursorHeight = baseCursorHeight * scale
 
         // Calculate visual position scaled around center (320, 240) and translated (only in
         // non-anchored mode)
@@ -5571,6 +5427,10 @@ class MainActivity :
 
         val visualX = 320f + (x - 320f) * scale + transX
         val visualY = 240f + (y - 240f) * scale + transY
+        val maxEyeX = 640f - scaledCursorWidth
+        val maxEyeY = 480f - scaledCursorHeight
+        val clampedEyeX = visualX.coerceIn(0f, maxEyeX)
+        val clampedEyeY = visualY.coerceIn(0f, maxEyeY)
 
         // Logic to prevent "wrapping":
         // 1. Left cursor should ONLY be visible if it is within the left screen bounds (< 640)
@@ -5580,14 +5440,16 @@ class MainActivity :
         // visibility at edges,
         // but strictly preventing wrapping means keeping it to the 640 boundary.
 
-        val showLeft = shouldRenderCursor && visualX < 640f
-        val showRight = shouldRenderCursor && visualX >= 0f
+        // Keep each cursor fully inside its own eye region to avoid overlap artifacts.
+        val isWithinEyeBounds = visualX in 0f..maxEyeX && visualY in 0f..maxEyeY
+        val showLeft = shouldRenderCursor && isWithinEyeBounds
+        val showRight = false
 
         // Left screen cursor - pivot at top-left so scaling happens from cursor tip
         cursorLeftView.pivotX = 0f
         cursorLeftView.pivotY = 0f
-        cursorLeftView.x = visualX
-        cursorLeftView.y = visualY
+        cursorLeftView.x = clampedEyeX
+        cursorLeftView.y = clampedEyeY
         cursorLeftView.scaleX = scale
         cursorLeftView.scaleY = scale
         cursorLeftView.visibility = if (showLeft) View.VISIBLE else View.GONE
@@ -5595,8 +5457,8 @@ class MainActivity :
         // Right screen cursor, offset by 640 pixels to appear on the right screen
         cursorRightView.pivotX = 0f
         cursorRightView.pivotY = 0f
-        cursorRightView.x = visualX + 640
-        cursorRightView.y = visualY
+        cursorRightView.x = clampedEyeX + 640
+        cursorRightView.y = clampedEyeY
         cursorRightView.scaleX = scale
         cursorRightView.scaleY = scale
         cursorRightView.visibility = if (showRight) View.VISIBLE else View.GONE
@@ -6078,6 +5940,10 @@ class MainActivity :
             dualWebViewGroup.noteUserInteraction()
         }
 
+        if (!isMouseEvent && SystemClock.uptimeMillis() < suppressTouchDispatchUntil) {
+            return true
+        }
+
         return super.dispatchTouchEvent(ev)
     }
 
@@ -6145,8 +6011,7 @@ class MainActivity :
 
     // In the implementation of NavigationListener
     override fun onHomePressed() {
-        val homeUrl = dualWebViewGroup.getBookmarksView().getHomeUrl()
-        webView.loadUrl(homeUrl)
+        webView.loadUrl(Constants.DEFAULT_URL)
     }
 
     // In the implementation of NavigationListener
@@ -6314,6 +6179,9 @@ class MainActivity :
         }
 
         if (url.startsWith("about:blank")) {
+            return
+        }
+        if (!isAllowedInSingleAppMode(Uri.parse(url))) {
             return
         }
 

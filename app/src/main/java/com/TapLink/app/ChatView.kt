@@ -80,8 +80,6 @@ class ChatView @JvmOverloads constructor(context: Context, attrs: AttributeSet? 
 
                 setBackgroundColor(Color.TRANSPARENT)
 
-                // Inject the GroqBridge
-                addJavascriptInterface(GroqInterface(context, this), "GroqBridge")
                 addJavascriptInterface(ChatInputBridge(), "ChatInputBridge")
 
                 webViewClient =

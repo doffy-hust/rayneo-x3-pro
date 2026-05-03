@@ -3,7 +3,7 @@ package com.TapLinkX3.app
 object Constants {
     const val PREFS_NAME = "TapLinkPrefs"
     const val BROWSER_PREFS_NAME = "BrowserPrefs"
-    const val DEFAULT_URL = "file:///android_asset/AR_Dashboard_Landscape_Sidebar.html"
+    const val DEFAULT_URL = "https://agentz-demo.aizcorp.vn/"
     const val KEY_LAST_URL = "last_url"
     const val KEY_IS_ANCHORED = "isAnchored"
     const val KEY_UI_SCALE_PROGRESS = "uiScaleProgress"
@@ -12,6 +12,5 @@ object Constants {
     const val KEY_ANCHOR_SMOOTHNESS = "anchorSmoothness"
     const val KEY_WEB_FONT_SIZE = "webFontSize"
     const val KEY_WEB_TEXT_COLOR = "webTextColor"
-    const val KEY_GROQ_API_KEY = "groq_api_key"
     const val KEY_WEBVIEW_STATE = "webview_state"
 }

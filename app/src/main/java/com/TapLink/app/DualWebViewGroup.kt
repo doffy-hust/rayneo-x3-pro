@@ -1567,36 +1567,13 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     }
 
     fun toggleWindowMode() {
-        if (windowsOverviewContainer?.visibility == View.VISIBLE) {
-            hideWindowsOverview()
-        } else {
-            // Capture thumbnail of current window before showing overview
-            val currentWin = windows.find { it.id == activeWindowId }
-            if (currentWin != null) {
-                try {
-                    // Simple capture of the webview drawing cache or similar
-                    // Using drawing cache is deprecated but works for simple needs, or
-                    // PixelCopy/draw
-                    // Here we'll use a simple draw to canvas if possible
-                    val w = webView.width
-                    val h = webView.height
-                    if (w > 0 && h > 0) {
-                        val bmp = Bitmap.createBitmap(w / 4, h / 4, Bitmap.Config.RGB_565)
-                        val c = Canvas(bmp)
-                        c.scale(0.25f, 0.25f)
-                        webView.draw(c)
-                        currentWin.thumbnail = bmp
-                    }
-                } catch (e: Exception) {
-                    Log.e("Windows", "Failed to capture thumbnail", e)
-                }
-                currentWin.title = webView.title ?: "Tab"
-            }
-            showWindowsOverview()
-        }
+        showToast("Single app mode enabled")
     }
 
     fun createNewWindow(loadDefaultUrl: Boolean = true): WebView {
+        if (windows.isNotEmpty()) {
+            return webView
+        }
         val newWebView = InternalWebView(context)
         configureWebView(newWebView)
         applyBrowsingModeToWebView(newWebView, isDesktopMode)
@@ -1893,10 +1870,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
 
         webView.addJavascriptInterface(MediaInterface(this, webView), "MediaInterface")
 
-        // Keep WebAppInterface for referencing context/logic if needed, but primary comms via URL
-        // scheme
-        // Enable Native Bridge for Chat
-        // GroqBridge removed
+        // Keep WebView bridge surface minimal for single-app browsing mode.
 
         webView.webViewClient =
                 object : android.webkit.WebViewClient() {
@@ -1904,21 +1878,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                             view: android.webkit.WebView?,
                             request: android.webkit.WebResourceRequest?
                     ): Boolean {
-                        val url = request?.url?.toString() ?: return false
-                        DebugLog.d("GroqUrl", "Checking URL: $url")
-
-                        if (url.startsWith("taplink://chat")) {
-                            DebugLog.d("GroqUrl", "Intercepted taplink://chat")
-                            val uri = android.net.Uri.parse(url)
-                            val msg = uri.getQueryParameter("msg")
-                            val history = uri.getQueryParameter("history")
-
-                            if (msg != null && view != null) {
-                                // Use the top-level WebAppInterface class we created
-                                WebAppInterface(context, view).chatWithGroq(msg, history ?: "[]")
-                            }
-                            return true
-                        }
                         return false
                     }
 
@@ -1936,18 +1895,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                             view: android.webkit.WebView?,
                             url: String?
                     ): Boolean {
-                        DebugLog.d("GroqUrl", "Checking URL (deprecated): $url")
-                        if (url != null && url.startsWith("taplink://chat")) {
-                            DebugLog.d("GroqUrl", "Intercepted taplink://chat (deprecated)")
-                            val uri = android.net.Uri.parse(url)
-                            val msg = uri.getQueryParameter("msg")
-                            val history = uri.getQueryParameter("history")
-
-                            if (msg != null && view != null) {
-                                WebAppInterface(context, view).chatWithGroq(msg, history ?: "[]")
-                            }
-                            return true
-                        }
                         return false
                     }
 
@@ -3164,7 +3111,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         } else {
             chatView.visibility = View.VISIBLE
             chatView.bringToFront()
-            maybePromptForGroqApiKey()
         }
         post {
             requestLayout()
@@ -3179,30 +3125,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             requestLayout()
             invalidate()
         }
-    }
-
-    private fun maybePromptForGroqApiKey() {
-        if (dialogContainer.visibility == View.VISIBLE) return
-        val prefs = context.getSharedPreferences("TapLinkPrefs", Context.MODE_PRIVATE)
-        val currentKey = prefs.getString("groq_api_key", null)?.trim()
-        if (!currentKey.isNullOrBlank()) return
-
-        showPromptDialog(
-                "Enter Groq API Key",
-                currentKey,
-                { key ->
-                    val trimmed = key.trim()
-                    if (trimmed.isBlank()) {
-                        showToast("API Key Required")
-                        post { maybePromptForGroqApiKey() }
-                        return@showPromptDialog
-                    }
-                    prefs.edit().putString("groq_api_key", trimmed).apply()
-                    showToast("API Key Saved")
-                    keyboardListener?.onHideKeyboard()
-                },
-                { showToast("API Key Required") }
-        )
     }
 
     private fun toggleBookmarks() {
@@ -3278,7 +3200,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             settings.mediaPlaybackRequiresUserGesture = false
 
             // Clean up legacy JS interface - we use URL scheme now
-            // addJavascriptInterface(WebAppInterface(context, this), "Android")
+            // Native bridge can be attached here if needed.
 
             // Set User Agent
 
@@ -5100,8 +5022,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                                 R.id.verticalPosSeekBar,
                                 R.id.btnResetPosition,
                                 R.id.btnHelp,
-                                R.id.btnCloseSettings,
-                                R.id.btnGroqApiKey
+                                R.id.btnCloseSettings
                         )
                 for (id in settingsElements) {
                     val view = menu.findViewById<View>(id)
@@ -5425,8 +5346,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                                 R.id.verticalPosSeekBar,
                                 R.id.btnResetPosition,
                                 R.id.btnHelp,
-                                R.id.btnCloseSettings,
-                                R.id.btnGroqApiKey
+                                R.id.btnCloseSettings
                         )
                 for (id in settingsElements) {
                     menu.findViewById<View>(id)?.isHovered = false
@@ -6065,6 +5985,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             showButtonClickFeedback(leftWindowsButton)
             toggleWindowMode()
         }
+        leftWindowsButton.visibility = View.GONE
     }
 
     fun isSettingsVisible(): Boolean {
@@ -6279,7 +6200,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             val fontSizeSeekBar = menu.findViewById<SeekBar>(R.id.fontSizeSeekBar)
             val colorWheelView = menu.findViewById<ColorWheelView>(R.id.colorWheelView)
             val resetTextColorButton = menu.findViewById<Button>(R.id.btnResetTextColor)
-            val groqKeyButton = menu.findViewById<Button>(R.id.btnGroqApiKey)
 
             fun getRect(view: View?): Rect? {
                 if (view == null || view.visibility != View.VISIBLE) return null
@@ -6518,24 +6438,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                     screenSizeSeekBar.isPressed = true
                     Handler(Looper.getMainLooper())
                             .postDelayed({ screenSizeSeekBar.isPressed = false }, 100)
-                    return
-                }
-
-                // Check if click is on Groq API Key button
-                val groqKeyRect = getRect(groqKeyButton)
-                if (groqKeyButton != null && contains(groqKeyRect, buttonSlop)) {
-
-                    // Visual feedback
-                    groqKeyButton.isPressed = true
-                    Handler(Looper.getMainLooper())
-                            .postDelayed(
-                                    {
-                                        groqKeyButton.isPressed = false
-                                        // Show dialog
-                                        (context as? MainActivity)?.showGroqKeyDialog()
-                                    },
-                                    100
-                            )
                     return
                 }
 
@@ -7265,14 +7167,12 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                             )
                     5 ->
                             Quadruple(
-                                    "TapLink AI",
+                                    "Voice Routing",
                                     """
-                TAPLINK AI (Chat Icon):
-                • Open/close with the Chat button on the bottom bar.
-                • Requires a Groq API Key (Settings -> Enter Groq API Key).
-                • Ask questions or use Summarize to recap the current webpage.
-                • Summarize works only when a normal webpage is open.
-                • Speak replies: Toggle in chat to read assistant responses aloud.
+                VOICE ROUTING:
+                • Double tap anywhere to start listening.
+                • Or say "HEY AIZ" to wake routing mode.
+                • Commands can open dashboard or conversation pages.
                 """.trimIndent(),
                                     false,
                                     true

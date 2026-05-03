@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>TapLinkX3 Dashboard · Landscape + Sidebar</title>
+  <title>AIZ Dashboard · Landscape + Sidebar</title>
   <style>
     :root {
       --bg: #000000;
@@ -744,12 +744,10 @@
 
   <div class="hud" data-taplink-scroll="true">
     <div class="topbar">
-      <strong style="color:var(--text)">TapLinkX3 Dashboard</strong>
+      <strong style="color:var(--text)">AIZ Dashboard</strong>
       <div style="flex:1"></div>
       <div class="topbar-actions">
         <button class="btn" id="openQrScanner" type="button">QR Scanner</button>
-        <button class="btn" id="editToggle" type="button">Edit Links</button>
-        <button class="btn" id="addLink" type="button">Add Link</button>
 
       </div>
       <input id="appSearch" class="search" placeholder="Filter apps." />
@@ -810,86 +808,14 @@
 
 
     /* Apps list */
-    const storageKey = 'dashboardLinksV1';
+    const storageKey = 'dashboardLinksV2';
     const defaultApps = {
-      // Social & Messaging
-      gmessages: { name: 'Google Messages', url: 'https://messages.google.com/web/welcome' },
-      discord: { name: 'Discord', url: 'https://discord.com/app' },
-      whatsapp: { name: 'WhatsApp', url: 'https://web.whatsapp.com' },
-      instagram: { name: 'Instagram', url: 'https://www.instagram.com' },
-      reddit: { name: 'Reddit', url: 'https://www.reddit.com' },
-      telegram: { name: 'Telegram', url: 'https://web.telegram.org' },
-      tiktok: { name: 'TikTok', url: 'https://www.tiktok.com' },
-
-      // Media & Search
-      youtube: { name: 'YouTube', url: 'https://www.youtube.com' },
-      informaltech: { name: 'Informal Tech', url: 'https://www.youtube.com/@informal-tech' },
-      gmaps: { name: 'Google Maps', url: 'https://www.google.com/maps' },
-      minijuegos: { name: 'Minijuegos', url: 'https://www.minijuegos.com' },
-
-      // Music Streaming
-      ytmusic: { name: 'YouTube Music', url: 'https://music.youtube.com' },
-      spotify: { name: 'Spotify', url: 'https://open.spotify.com' },
-      applemusic: { name: 'Apple Music', url: 'https://music.apple.com' },
-      tidal: { name: 'Tidal', url: 'https://listen.tidal.com' },
-      deezer: { name: 'Deezer', url: 'https://www.deezer.com' },
-      audiomack: { name: 'Audiomack', url: 'https://audiomack.com' },
-      soundcloud: { name: 'SoundCloud', url: 'https://soundcloud.com' },
-
-      // Creativity / Multimedia
-      photopea: { name: 'Photopea (Photo)', url: 'https://www.photopea.com' },
-      clipchamp: { name: 'Clipchamp (Video)', url: 'https://clipchamp.com/en/video-editor/' },
-      bandlab: { name: 'BandLab (DAW)', url: 'https://www.bandlab.com' },
-      wireframe: { name: 'Wireframe.cc', url: 'https://wireframe.cc' },
-      kleki: { name: 'Kleki', url: 'https://kleki.com' },
-
-      // Productivity / Docs
-      todoist: { name: 'Todoist', url: 'https://www.todoist.com' },
-      stackedit: { name: 'StackEdit (Text)', url: 'https://stackedit.io/app' },
-      sejda: { name: 'Sejda PDF Editor', url: 'https://www.sejda.com/pdf-editor' },
-
-      // LLMs / Chatbots
-      gemini: { name: 'Gemini', url: 'https://gemini.google.com' },
-      googleaistudio: { name: 'Google AI Studio', url: 'https://aistudio.google.com' },
-      jules: { name: 'Jules (Code)', url: 'https://jules.google.com' },
-      perplexity: { name: 'Perplexity', url: 'https://www.perplexity.ai' },
-      chatgpt: { name: 'ChatGPT', url: 'https://chatgpt.com' },
-      claude: { name: 'Claude', url: 'https://claude.ai' },
-      deepseek: { name: 'DeepSeek', url: 'https://chat.deepseek.com' },
-      grok: { name: 'Grok', url: 'https://grok.com' },
-
-      // Utilities / Reference
-      wikipedia: { name: 'Wikipedia', url: 'https://www.wikipedia.org' },
-      translate: { name: 'Google Translate', url: 'https://translate.google.com' },
-      wolfram: { name: 'WolframAlpha', url: 'https://www.wolframalpha.com' },
-
-      // AI Music Generation
-      suno: { name: 'Suno (AI Music)', url: 'https://suno.com' },
-      udio: { name: 'Udio (AI Music)', url: 'https://www.udio.com' },
-      stableaudio: { name: 'Stable Audio', url: 'https://stableaudio.com' },
-
-      // AI Video Generation
-      runway: { name: 'Runway (AI Video)', url: 'https://runwayml.com' },
-      pika: { name: 'Pika (AI Video)', url: 'https://pika.art' },
-      luma: { name: 'Luma Dream Machine', url: 'https://lumalabs.ai/dream-machine' },
-
-      // AI Voice / Cloning
-      elevenlabs: { name: 'ElevenLabs (Voice)', url: 'https://elevenlabs.io' },
-      playht: { name: 'PlayHT (Voice)', url: 'https://play.ht' }
+      agentz: { name: 'AgentZ', url: 'https://agentz-demo.aizcorp.vn/' },
+      // adaptz: { name: 'AdaptZ', url: 'https://adapt.adaptz.beta/' }
     };
 
     const defaultGroups = [
-      { title: 'Navigation / Entertainment', cls: 'sec-nav', keys: ['youtube', 'informaltech', 'gmaps', 'minijuegos', 'tiktok'] },
-      { title: 'AI / Chatbots', cls: 'sec-llm', keys: ['gemini', 'googleaistudio', 'jules', 'perplexity', 'chatgpt', 'claude', 'deepseek', 'grok'] },
-      { title: 'Social / Communication', cls: 'sec-social', keys: ['gmessages', 'discord', 'whatsapp', 'instagram', 'reddit', 'telegram'] },
-      { title: 'Music / Streaming', cls: 'sec-music', keys: ['ytmusic', 'spotify', 'applemusic', 'tidal', 'deezer', 'audiomack', 'soundcloud'] },
-      { title: 'Creativity / Multimedia', cls: 'sec-creative', keys: ['photopea', 'clipchamp', 'bandlab', 'wireframe', 'kleki'] },
-      { title: 'Productivity / Documents', cls: 'sec-prod', keys: ['todoist', 'stackedit', 'sejda'] },
-      { title: 'Utilities / Reference', cls: 'sec-util', keys: ['wikipedia', 'translate', 'wolfram'] },
-      { title: 'AI Music', cls: 'sec-aimusic', keys: ['suno', 'udio', 'stableaudio'] },
-      { title: 'AI Video', cls: 'sec-aivideo', keys: ['runway', 'pika', 'luma'] },
-      { title: 'AI Voice', cls: 'sec-voice', keys: ['elevenlabs', 'playht'] },
-      { title: 'Custom Links', cls: 'sec-custom', keys: [] }
+      { title: 'AIZ', cls: 'sec-custom', keys: ['agentz', 'adaptz'] }
     ];
 
     function normalizeTitle(value) {
@@ -935,25 +861,6 @@
       return base;
     }
 
-    function ensureRedditMigration(dashboardState) {
-      let changed = false;
-      if (!dashboardState.apps.reddit) {
-        dashboardState.apps.reddit = { ...defaultApps.reddit };
-        changed = true;
-      }
-
-      const social = dashboardState.groups.find(
-        group => normalizeTitle(group.title).toLowerCase() === 'social / communication'
-      );
-
-      if (social && Array.isArray(social.keys) && !social.keys.includes('reddit')) {
-        social.keys.push('reddit');
-        changed = true;
-      }
-
-      return changed;
-    }
-
     function loadState() {
       const fallbackGroups = JSON.parse(JSON.stringify(defaultGroups));
       fallbackGroups.forEach(g => {
@@ -980,8 +887,7 @@
     }
 
     let state = loadState();
-    const migratedReddit = ensureRedditMigration(state);
-    if (sanitizeGroups(state.groups) || migratedReddit) {
+    if (sanitizeGroups(state.groups)) {
       persistState();
     }
 
@@ -1030,7 +936,9 @@
     function setEditingMode(enabled) {
       isEditing = enabled;
       document.body.dataset.editing = enabled ? 'true' : 'false';
-      editToggle.textContent = enabled ? 'Done' : 'Edit Links';
+      if (editToggle) {
+        editToggle.textContent = enabled ? 'Done' : 'Edit Links';
+      }
       renderAll();
     }
 
@@ -1068,7 +976,7 @@
           return g.title;
         }
       }
-      return state.groups[0]?.title || 'Custom Links';
+      return state.groups[0]?.title || 'AIZ';
     }
 
     function updateGroupOptions(selectedTitle) {
@@ -1098,7 +1006,7 @@
         modalTitle.textContent = 'Add Link';
         linkName.value = '';
         linkUrl.value = '';
-        updateGroupOptions('Custom Links');
+        updateGroupOptions('AIZ');
       }
       linkModal.classList.remove('hidden');
       modalOpenTime = Date.now();
@@ -1138,8 +1046,12 @@
       button.addEventListener('click', activate);
     }
 
-    bindImmediate(editToggle, () => setEditingMode(!isEditing));
-    bindImmediate(addLink, () => openModal('add'));
+    if (editToggle) {
+      bindImmediate(editToggle, () => setEditingMode(!isEditing));
+    }
+    if (addLink) {
+      bindImmediate(addLink, () => openModal('add'));
+    }
     bindImmediate(openQrScanner, () => openQrPage());
     if (closeQrScanner) {
       bindActivate(closeQrScanner, () => closeQrPage());
@@ -1164,7 +1076,7 @@
         linkError.textContent = 'Name and URL are required.';
         return;
       }
-      const targetGroupTitle = linkGroup.value || 'Custom Links';
+      const targetGroupTitle = linkGroup.value || 'AIZ';
       if (editingKey) {
         state.apps[editingKey] = { name, url };
         removeFromGroups(editingKey);

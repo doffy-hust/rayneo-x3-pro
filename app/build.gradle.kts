@@ -1,13 +1,25 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.jetbrains.kotlin.android)
 }
 
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     namespace = "com.TapLinkX3.app"
     compileSdk = 36
+    val rawLoginEmail = localProperties.getProperty("AIZ_LOGIN_EMAIL") ?: System.getenv("AIZ_LOGIN_EMAIL") ?: ""
+    val rawLoginPassword = localProperties.getProperty("AIZ_LOGIN_PASSWORD") ?: System.getenv("AIZ_LOGIN_PASSWORD") ?: ""
+    val loginEmail = rawLoginEmail.replace("\\", "\\\\").replace("\"", "\\\"")
+    val loginPassword = rawLoginPassword.replace("\\", "\\\\").replace("\"", "\\\"")
 
     defaultConfig {
         applicationId = "com.TapLinkX3.app"
@@ -15,6 +27,8 @@ android {
         targetSdk = 36
         versionCode = 13
         versionName = "1.5.0"
+        buildConfigField("String", "LOGIN_EMAIL", "\"$loginEmail\"")
+        buildConfigField("String", "LOGIN_PASSWORD", "\"$loginPassword\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -23,11 +37,11 @@ android {
         debug {
             applicationIdSuffix = ".debug"  // Add this line
             // Append .debug to the package name for debug builds
-            resValue("string", "app_name", "TapLink_dev")
+            resValue("string", "app_name", "AIZ_DEV")
         }
 
         release {
-            resValue("string", "app_name", "TapLink X3")
+            resValue("string", "app_name", "AIZ_DEV")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -69,6 +83,7 @@ dependencies {
     implementation(libs.androidx.constraintlayout)
     implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.webkit)
+    implementation(libs.androidx.security.crypto)
 
     // Google
     implementation(libs.material)
