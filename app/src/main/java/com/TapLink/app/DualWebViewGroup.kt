@@ -1805,8 +1805,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                             parcel.recycle()
                             // Restore state returns the WebBackForwardList but we don't need it
                             // explicitly
-                            newWebView.restoreState(state)
-                            restored = true
+                            restored = newWebView.restoreState(state) != null
                         } catch (e: Exception) {
                             Log.e("Persistence", "Failed to restore webview bundle", e)
                         }

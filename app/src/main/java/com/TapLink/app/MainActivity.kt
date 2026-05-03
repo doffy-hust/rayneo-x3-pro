@@ -1331,15 +1331,9 @@ class MainActivity :
             dualWebViewGroup.stopAnchoring()
         }
 
-        // Then try to restore the previous state
-        setupWebView() // This will attempt to load the saved URL
-
-        // Only clear cache/history if restoration failed
-        if (webView.url == null || webView.url == "about:blank") {
-            webView.clearCache(true)
-            webView.clearHistory()
-            webView.loadUrl(Constants.DEFAULT_URL)
-        }
+        // Configure the active WebView. Startup navigation is restored by
+        // DualWebViewGroup.restoreState() only (legacy BrowserPrefs restore disabled).
+        setupWebView()
         // Initialize camera after WebView setup
         if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) ==
                         PackageManager.PERMISSION_GRANTED
@@ -3758,7 +3752,6 @@ class MainActivity :
             isFocusableInTouchMode = true
             importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_YES
             setBackgroundColor(Color.BLACK)
-            visibility = View.INVISIBLE
             overScrollMode = View.OVER_SCROLL_NEVER
 
             // Section 2: WebView Settings Configuration
@@ -4316,11 +4309,6 @@ class MainActivity :
         @Suppress("DEPRECATION")
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
 
-        // Only try restoration if this is the initial window
-        if (webView == dualWebViewGroup.getWebView()) {
-            tryRestoreSession()
-        }
-
         // Initialize AudioManager
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
@@ -4359,66 +4347,6 @@ class MainActivity :
                 },
                 "AndroidMediaInterface"
         )
-    }
-
-    private fun tryRestoreSession() {
-        // Before loading the initial page, try to restore the previous session
-        DebugLog.d("WebViewDebug", "Attempting to restore previous session")
-
-        try {
-            dualWebViewGroup.updateBrowsingMode(dualWebViewGroup.isDesktopMode())
-            val prefs = getSharedPreferences(prefsName, MODE_PRIVATE)
-            val savedState = prefs.getString(Constants.KEY_WEBVIEW_STATE, null)
-            val lastUrl = prefs.getString(keyLastUrl, null)
-            DebugLog.d("WebViewDebug", "Last saved URL: $lastUrl")
-
-            val defaultDashboardUrl = Constants.DEFAULT_URL
-            var restored = false
-
-            if (!savedState.isNullOrBlank()) {
-                try {
-                    val data = Base64.decode(savedState, Base64.DEFAULT)
-                    val parcel = Parcel.obtain()
-                    parcel.unmarshall(data, 0, data.size)
-                    parcel.setDataPosition(0)
-                    val bundle = Bundle.CREATOR.createFromParcel(parcel)
-                    parcel.recycle()
-                    restored = webView.restoreState(bundle) != null
-                    DebugLog.d("WebViewDebug", "WebView state restored: $restored")
-                } catch (e: Exception) {
-                    DebugLog.e("WebViewDebug", "Error restoring WebView state", e)
-                }
-            }
-
-            if (!restored) {
-                if (lastUrl != null &&
-                                !lastUrl.startsWith("about:blank") &&
-                                isAllowedInSingleAppMode(Uri.parse(lastUrl))
-                ) {
-                    DebugLog.d("WebViewDebug", "Loading saved URL: $lastUrl")
-                    webView.loadUrl(lastUrl)
-                } else {
-                    DebugLog.d("WebViewDebug", "No valid saved URL, loading default AR dashboard")
-                    webView.loadUrl(defaultDashboardUrl)
-                }
-            } else {
-                // Restored pages may skip onPageFinished; inject observers and refresh scrollbars.
-                webView.post {
-                    dualWebViewGroup.injectPageObservers(webView)
-                    dualWebViewGroup.updateScrollBarsVisibility()
-                }
-                webView.postDelayed(
-                        {
-                            dualWebViewGroup.injectPageObservers(webView)
-                            dualWebViewGroup.updateScrollBarsVisibility()
-                        },
-                        750
-                )
-            }
-        } catch (e: Exception) {
-            DebugLog.e("WebViewDebug", "Error restoring session", e)
-            webView.loadUrl(Constants.DEFAULT_URL)
-        }
     }
 
     private fun maybePerformAutoLogin(targetWebView: WebView?, url: String) {
@@ -5002,12 +4930,6 @@ class MainActivity :
                 }
             }
         }
-    }
-
-    private fun loadInitialPage() {
-        DebugLog.d("WebViewDebug", "loadInitialPage called")
-        // Load Google directly without the intermediate blank page
-        webView.loadUrl(Constants.DEFAULT_URL)
     }
 
     fun showCustomKeyboard() {
