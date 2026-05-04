@@ -84,6 +84,7 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.asin
 import kotlin.math.atan2
+import org.json.JSONArray
 import org.json.JSONObject
 
 interface NavigationListener {
@@ -389,7 +390,13 @@ class MainActivity :
     private var rayNeoDoubleVoiceDeferRunnable: Runnable? = null
     private var isTripleTapInProgress = false
     private var suppressTouchDispatchUntil = 0L
-    private var pendingConversationFillText: String? = null
+    private val groqChatService by lazy { GroqChatService(GroqAudioService(this)) }
+    private var cachedChatAgents: List<ChatAgent> = emptyList()
+    private var cachedChatAgentsAt: Long = 0L
+    // Bumps for each voice->chat command so stale async callbacks cannot send older text later.
+    private var chatVoicePipelineGeneration: Long = 0L
+    /** After full [WebView.loadUrl] to the conversation route, run voice follow-up (SPA uses in-callback). */
+    private var pendingConversationNavigationComplete: (() -> Unit)? = null
     private var autoLoginAttemptedUrl: String? = null
     private var wakeWordArmed = false
     private var lastSpeechPreviewToastAt = 0L
@@ -2702,18 +2709,30 @@ class MainActivity :
         }
 
         val route = resolveRouteFromCommand(normalized)
-        if (route == conversationRouteUrl) {
-            pendingConversationFillText = extractConversationPayload(trimmed)
-            navigateRouteWithoutReload(
-                    routeUrl = conversationRouteUrl,
-                    payload = pendingConversationFillText
-            )
-            wakeWordArmed = false
-            return
-        }
+        val alreadyOnChat =
+                webView.url.orEmpty().startsWith(conversationRouteUrl, ignoreCase = true)
+
         if (route == dashboardRouteUrl) {
             navigateRouteWithoutReload(routeUrl = dashboardRouteUrl)
             wakeWordArmed = false
+            return
+        }
+
+        val chatVoiceIntent =
+                route == conversationRouteUrl ||
+                        (alreadyOnChat && route != dashboardRouteUrl)
+        if (chatVoiceIntent) {
+            wakeWordArmed = false
+            chatVoicePipelineGeneration += 1L
+            val generation = chatVoicePipelineGeneration
+            val strippedMessage = extractConversationPayload(trimmed)?.trim().orEmpty()
+            if (route == conversationRouteUrl && !alreadyOnChat) {
+                navigateRouteWithoutReload(conversationRouteUrl) {
+                    scheduleConversationVoicePipeline(trimmed, strippedMessage, generation = generation)
+                }
+            } else {
+                scheduleConversationVoicePipeline(trimmed, strippedMessage, generation = generation)
+            }
             return
         }
         if (wakeWordArmed) {
@@ -2789,15 +2808,90 @@ class MainActivity :
         return value.takeIf { it.isNotBlank() }
     }
 
+    fun cacheChatAgentsFromJs(json: String) {
+        runOnUiThread {
+            try {
+                val arr = JSONArray(json)
+                val out = ArrayList<ChatAgent>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val name = o.optString("name", "").trim()
+                    if (name.isNotEmpty()) {
+                        out.add(ChatAgent(name, o.optString("description", "").trim()))
+                    }
+                }
+                cachedChatAgents = out
+                cachedChatAgentsAt = SystemClock.elapsedRealtime()
+            } catch (e: Exception) {
+                DebugLog.e("ChatAgents", "cacheChatAgentsFromJs", e)
+            }
+        }
+    }
+
+    /**
+     * Populates [cachedChatAgents] via [AndroidInterface.cacheChatAgents]. If options are not in
+     * the DOM until the select opens, the script clicks `#chat-agent-select-trigger` once and
+     * re-scrapes. Tweak name/description selectors if the web app markup changes
+     * (see `.chat-agent-option` children).
+     */
+    private fun injectChatAgentScraper(target: WebView?) {
+        if (target == null) return
+        val js =
+                """
+            (function(){
+              function scrape(){
+                return Array.from(document.querySelectorAll('.chat-agent-option'))
+                  .map(function(el) {
+                    var nameEl = el.querySelector('[data-agent-name], .agent-name');
+                    var name = (nameEl && nameEl.innerText ? nameEl.innerText : '')
+                      || (el.innerText ? el.innerText.split('\n')[0] : '') || '';
+                    name = name.trim();
+                    var desc = '';
+                    if (el.innerText) {
+                      var parts = el.innerText.split('\n');
+                      desc = parts.slice(1).join(' ').trim();
+                    }
+                    return { name: name, description: desc };
+                  })
+                  .filter(function(a) { return a.name; });
+              }
+              var found = scrape();
+              if (found.length && window.AndroidInterface && window.AndroidInterface.cacheChatAgents) {
+                window.AndroidInterface.cacheChatAgents(JSON.stringify(found));
+                return;
+              }
+              var trig = document.querySelector('#chat-agent-select-trigger');
+              if (!trig) return;
+              trig.click();
+              setTimeout(function(){
+                var list = scrape();
+                if (list.length && window.AndroidInterface && window.AndroidInterface.cacheChatAgents) {
+                  window.AndroidInterface.cacheChatAgents(JSON.stringify(list));
+                }
+                try { document.body.click(); } catch (e) {}
+              }, 250);
+            })();
+        """.trimIndent()
+        target.evaluateJavascript(js, null)
+    }
+
     /**
      * Prefer SPA-style route changes (no full page refresh). Falls back to loadUrl when the current
      * page cannot be routed in-place.
      */
-    private fun navigateRouteWithoutReload(routeUrl: String, payload: String? = null) {
+    private fun navigateRouteWithoutReload(
+            routeUrl: String,
+            onInPageRouted: (() -> Unit)? = null
+    ) {
         val currentUrl = webView.url.orEmpty()
         val current = runCatching { Uri.parse(currentUrl) }.getOrNull()
         val target = runCatching { Uri.parse(routeUrl) }.getOrNull()
         if (current == null || target == null) {
+            if (routeUrl.startsWith(conversationRouteUrl, ignoreCase = true) &&
+                            onInPageRouted != null
+            ) {
+                pendingConversationNavigationComplete = onInPageRouted
+            }
             webView.loadUrl(routeUrl)
             return
         }
@@ -2807,6 +2901,11 @@ class MainActivity :
                         current.host.equals(target.host, ignoreCase = true) &&
                         current.port == target.port
         if (!sameOrigin) {
+            if (routeUrl.startsWith(conversationRouteUrl, ignoreCase = true) &&
+                            onInPageRouted != null
+            ) {
+                pendingConversationNavigationComplete = onInPageRouted
+            }
             webView.loadUrl(routeUrl)
             return
         }
@@ -2816,9 +2915,6 @@ class MainActivity :
                 target.encodedQuery?.let { "?$it" }.orEmpty() + target.encodedFragment?.let { "#$it" }
                         .orEmpty()
         val targetRelative = "$targetPath$targetQuery"
-        val payloadJs =
-                payload?.let { "window.__taplinkPendingConversationPayload = ${JSONObject.quote(it)};" }
-                        ?: ""
         val js =
                 """
             (function() {
@@ -2828,7 +2924,6 @@ class MainActivity :
                     if (window.location.pathname + window.location.search + window.location.hash === target) {
                         return 'already-there';
                     }
-                    $payloadJs
                     window.history.pushState({}, '', target);
                     window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
                     window.dispatchEvent(new Event('hashchange'));
@@ -2844,14 +2939,13 @@ class MainActivity :
             val routedInPage =
                     result?.contains("in-page") == true || result?.contains("already-there") == true
             if (routedInPage) {
-                if (!payload.isNullOrBlank() && routeUrl.startsWith(conversationRouteUrl, ignoreCase = true)) {
-                    // SPA route targets may render chat input asynchronously; retry helper handles delays.
-                    webView.postDelayed(
-                            { maybeInjectPendingConversationInput(webView, conversationRouteUrl) },
-                            250L
-                    )
-                }
+                onInPageRouted?.let { cb -> webView.postDelayed(cb, 350L) }
             } else {
+                if (routeUrl.startsWith(conversationRouteUrl, ignoreCase = true) &&
+                                onInPageRouted != null
+                ) {
+                    pendingConversationNavigationComplete = onInPageRouted
+                }
                 webView.loadUrl(routeUrl)
             }
         }
@@ -4467,7 +4561,13 @@ class MainActivity :
                                 view?.visibility = View.VISIBLE
                                 injectJavaScriptForInputFocus()
                                 maybePerformAutoLogin(view, url)
-                                maybeInjectPendingConversationInput(view, url)
+                                if (url.startsWith(conversationRouteUrl, ignoreCase = true)) {
+                                    injectChatAgentScraper(view)
+                                    pendingConversationNavigationComplete?.let { cb ->
+                                        pendingConversationNavigationComplete = null
+                                        webView.postDelayed(cb, 400L)
+                                    }
+                                }
 
                                 // Re-apply saved font settings to new page
                                 dualWebViewGroup.reapplyWebFontSettings()
@@ -4942,50 +5042,318 @@ class MainActivity :
         )
     }
 
-    private fun maybeInjectPendingConversationInput(targetWebView: WebView?, url: String) {
-        if (targetWebView == null) return
-        if (!url.startsWith(conversationRouteUrl, ignoreCase = true)) return
-        val pending = pendingConversationFillText ?: return
-        val trimmed = pending.trim()
-        if (trimmed.isBlank()) {
-            pendingConversationFillText = null
-            return
-        }
-        // Clear immediately so repeated onPageFinished calls don't re-inject
-        pendingConversationFillText = null
-        // SPA chat textarea may not be rendered right at onPageFinished; retry with delays
-        val js = """
-            (function() {
-                var input = document.querySelector('#chat-message-textarea');
-                if (!input) return 'missing-chat-input';
-                input.focus();
-                var proto = Object.getPrototypeOf(input);
-                var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (descriptor && descriptor.set) {
-                    descriptor.set.call(input, ${JSONObject.quote(trimmed)});
-                } else {
-                    input.value = ${JSONObject.quote(trimmed)};
+    private fun scheduleConversationVoicePipeline(
+            trimmed: String,
+            strippedMessage: String,
+            generation: Long,
+            attempt: Int = 0
+    ) {
+        if (generation != chatVoicePipelineGeneration) return
+        if (strippedMessage.isBlank()) return
+        injectChatAgentScraper(webView)
+        val maxAttempts = 10
+        val delayMs =
+                when {
+                    attempt == 0 -> 250L
+                    attempt < 4 -> 400L
+                    else -> 600L
                 }
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                return 'filled';
-            })();
-        """.trimIndent()
-        // First attempt immediately after page finished
-        targetWebView.evaluateJavascript(js) { result ->
-            if (result?.contains("missing-chat-input") == true) {
-                // Textarea not ready yet; retry after 800 ms then 2 s
-                targetWebView.postDelayed({
-                    targetWebView.evaluateJavascript(js) { r2 ->
-                        if (r2?.contains("missing-chat-input") == true) {
-                            targetWebView.postDelayed({
-                                targetWebView.evaluateJavascript(js, null)
-                            }, 1200)
-                        }
+        webView.postDelayed(
+                {
+                    if (generation != chatVoicePipelineGeneration) return@postDelayed
+                    if (cachedChatAgents.isEmpty() && attempt < maxAttempts) {
+                        injectChatAgentScraper(webView)
+                        scheduleConversationVoicePipeline(
+                                trimmed,
+                                strippedMessage,
+                                generation,
+                                attempt + 1
+                        )
+                    } else {
+                        runConversationVoiceActions(trimmed, strippedMessage, generation)
                     }
-                }, 800)
+                },
+                delayMs
+        )
+    }
+
+    private fun matchCachedAgentName(fromModel: String?): String? {
+        if (fromModel.isNullOrBlank()) return null
+        val want = normalizeVoiceText(fromModel)
+        for (ca in cachedChatAgents) {
+            val n = normalizeVoiceText(ca.name)
+            if (n == want || want.contains(n) || n.contains(want)) {
+                return ca.name
             }
         }
+        return null
+    }
+
+    private fun runConversationVoiceActions(
+            trimmed: String,
+            strippedMessage: String,
+            generation: Long
+    ) {
+        if (generation != chatVoicePipelineGeneration) return
+        if (strippedMessage.isBlank()) return
+        if (cachedChatAgents.isEmpty()) {
+            executeChatFillAndSend(strippedMessage, generation)
+            return
+        }
+        groqChatService.extractChatIntent(trimmed, cachedChatAgents) { intent, groqFailed ->
+            if (generation != chatVoicePipelineGeneration) return@extractChatIntent
+            val firstName = cachedChatAgents.first().name
+            val matched = matchCachedAgentName(intent.agentName)
+            val resolvedAgent = matched ?: firstName
+            val messageOut =
+                    sanitizeChatMessage(intent.message, strippedMessage, resolvedAgent)
+                            .ifBlank { strippedMessage }
+            if (groqFailed) {
+                dualWebViewGroup.showToast("Couldn't pick agent — using $firstName.", 2200L)
+            } else {
+                dualWebViewGroup.showToast("Asking $resolvedAgent…", 1600L)
+            }
+            executeChatVoiceCommand(resolvedAgent, messageOut, generation)
+        }
+    }
+
+    private fun sanitizeChatMessage(message: String, fallback: String, agentName: String): String {
+        val raw = message.trim().ifBlank { fallback.trim() }
+        if (raw.isBlank()) return raw
+        var out = raw
+        out = out.replace(
+                Regex("""(?i)^\s*((hey\s+)?aiz\s*)?(open|go\s*to|show)\s*(chat|conversation)\s*(and\s+)?"""),
+                ""
+        ).trim()
+        out = out.replace(
+                Regex("""(?i)^\s*(ask|tell|message)\s+${Regex.escape(agentName)}\s*(that)?\s*[:,-]?\s*"""),
+                ""
+        ).trim()
+        return out.ifBlank { fallback.trim() }
+    }
+
+    private fun evaluateConversationChatJs(
+            targetWebView: WebView?,
+            js: String,
+            generation: Long
+    ) {
+        if (targetWebView == null) return
+        if (generation != chatVoicePipelineGeneration) return
+        targetWebView.evaluateJavascript(js) { result ->
+            if (generation != chatVoicePipelineGeneration) return@evaluateJavascript
+            if (result?.contains("missing-chat-input") == true ||
+                            result?.contains("missing-send") == true
+            ) {
+                targetWebView.postDelayed(
+                        {
+                            if (generation != chatVoicePipelineGeneration) return@postDelayed
+                            targetWebView.evaluateJavascript(js) { r2 ->
+                                if (generation != chatVoicePipelineGeneration) return@evaluateJavascript
+                                if (r2?.contains("missing-chat-input") == true ||
+                                                r2?.contains("missing-send") == true
+                                ) {
+                                    targetWebView.postDelayed(
+                                            {
+                                                if (generation == chatVoicePipelineGeneration) {
+                                                    targetWebView.evaluateJavascript(js, null)
+                                                }
+                                            },
+                                            1200
+                                    )
+                                }
+                            }
+                        },
+                        800
+                )
+            }
+        }
+    }
+
+    private fun executeChatFillAndSend(message: String, generation: Long) {
+        val token = "voice-$generation"
+        val js =
+                """
+            (function(){
+              var msg = ${JSONObject.quote(message)};
+              var token = ${JSONObject.quote(token)};
+              if (!window.__taplinkVoiceSendState) window.__taplinkVoiceSendState = {};
+              var state = window.__taplinkVoiceSendState[token] || { sent: false };
+              window.__taplinkVoiceSendState[token] = state;
+              function setValue(el, value) {
+                var proto = Object.getPrototypeOf(el);
+                var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (descriptor && descriptor.set) {
+                  descriptor.set.call(el, value);
+                } else {
+                  el.value = value;
+                }
+              }
+              function isSendEnabled(btn) {
+                if (!btn) return false;
+                return !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
+              }
+              function triggerSend(ta, btn) {
+                if (state.sent) return true;
+                if (isSendEnabled(btn)) {
+                  btn.click();
+                  state.sent = true;
+                  return true;
+                }
+                return false;
+              }
+              function armReadAloudClickOnce() {
+                if (state.readArmed) return;
+                state.readArmed = true;
+                var known = new Set(
+                  Array.from(document.querySelectorAll('[id^="read-aloud-btn-"]')).map(function(el){ return el.id; })
+                );
+                var done = false;
+                var obs = new MutationObserver(function() {
+                  if (done) return;
+                  var buttons = Array.from(document.querySelectorAll('[id^="read-aloud-btn-"]'));
+                  for (var i = 0; i < buttons.length; i++) {
+                    var b = buttons[i];
+                    if (!known.has(b.id)) {
+                      known.add(b.id);
+                      done = true;
+                      try { b.click(); } catch (e) {}
+                      obs.disconnect();
+                      return;
+                    }
+                  }
+                });
+                try { obs.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
+                setTimeout(function(){ if (!done) obs.disconnect(); }, 20000);
+              }
+              function fillAndSend(){
+                var ta = document.querySelector('#chat-message-textarea');
+                if (!ta) return 'missing-chat-input';
+                ta.focus();
+                setValue(ta, '');
+                setValue(ta, msg);
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                var btn = document.querySelector('#chat-send-button');
+                if (!btn) return 'missing-send';
+                if (ta.value !== msg) return 'send-failed';
+                for (var i = 0; i < 8; i++) {
+                  if (triggerSend(ta, btn)) {
+                    armReadAloudClickOnce();
+                    return 'ok';
+                  }
+                }
+                return state.sent ? 'ok' : 'send-failed';
+              }
+              return fillAndSend();
+            })();
+        """.trimIndent()
+        evaluateConversationChatJs(webView, js, generation)
+    }
+
+    private fun executeChatVoiceCommand(agentDisplayName: String, message: String, generation: Long) {
+        val qAgent = JSONObject.quote(agentDisplayName)
+        val qMsg = JSONObject.quote(message)
+        val qToken = JSONObject.quote("voice-$generation")
+        val js =
+                """
+            (function(){
+              var targetAgent = $qAgent;
+              var msg = $qMsg;
+              var token = $qToken;
+              if (!window.__taplinkVoiceSendState) window.__taplinkVoiceSendState = {};
+              var state = window.__taplinkVoiceSendState[token] || { sent: false };
+              window.__taplinkVoiceSendState[token] = state;
+              function norm(s) {
+                try {
+                  return (s || '').toLowerCase().normalize('NFD').replace(/\p{M}+/gu,'').trim();
+                } catch (e) {
+                  return (s || '').toLowerCase().trim();
+                }
+              }
+              function pickAgent(cb) {
+                var trig = document.querySelector('#chat-agent-select-trigger');
+                if (!trig) { cb(false); return; }
+                trig.click();
+                setTimeout(function() {
+                  var opts = document.querySelectorAll('.chat-agent-option');
+                  var want = norm(targetAgent);
+                  var hit = Array.from(opts).find(function(o) {
+                    return norm(o.innerText).indexOf(want) >= 0 || want.indexOf(norm(o.innerText)) >= 0;
+                  });
+                  if (hit) { hit.click(); cb(true); return; }
+                  try { document.body.click(); } catch (e) {}
+                  cb(false);
+                }, 200);
+              }
+              function fillAndSend() {
+                var ta = document.querySelector('#chat-message-textarea');
+                if (!ta) return 'missing-chat-input';
+                ta.focus();
+                var proto = Object.getPrototypeOf(ta);
+                var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (descriptor && descriptor.set) {
+                  descriptor.set.call(ta, '');
+                  descriptor.set.call(ta, msg);
+                } else {
+                  ta.value = '';
+                  ta.value = msg;
+                }
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                var btn = document.querySelector('#chat-send-button');
+                if (!btn) return 'missing-send';
+                if (ta.value !== msg) return 'send-failed';
+                if (state.sent) return 'ok';
+                if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                  btn.click();
+                  state.sent = true;
+                  armReadAloudClickOnce();
+                  return 'ok';
+                }
+                for (var i = 0; i < 8; i++) {
+                  if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                    btn.click();
+                    state.sent = true;
+                    armReadAloudClickOnce();
+                    return 'ok';
+                  }
+                }
+                return state.sent ? 'ok' : 'send-failed';
+              }
+              function armReadAloudClickOnce() {
+                if (state.readArmed) return;
+                state.readArmed = true;
+                var known = new Set(
+                  Array.from(document.querySelectorAll('[id^="read-aloud-btn-"]')).map(function(el){ return el.id; })
+                );
+                var done = false;
+                var obs = new MutationObserver(function() {
+                  if (done) return;
+                  var buttons = Array.from(document.querySelectorAll('[id^="read-aloud-btn-"]'));
+                  for (var i = 0; i < buttons.length; i++) {
+                    var b = buttons[i];
+                    if (!known.has(b.id)) {
+                      known.add(b.id);
+                      done = true;
+                      try { b.click(); } catch (e) {}
+                      obs.disconnect();
+                      return;
+                    }
+                  }
+                });
+                try { obs.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
+                setTimeout(function(){ if (!done) obs.disconnect(); }, 20000);
+              }
+              pickAgent(function() {
+                var r = fillAndSend();
+                if (r !== 'ok') {
+                  setTimeout(function() { fillAndSend(); }, 600);
+                }
+              });
+              return 'started';
+            })();
+        """.trimIndent()
+        evaluateConversationChatJs(webView, js, generation)
     }
 
     private fun createCameraIntent(): Intent? {
@@ -6724,6 +7092,11 @@ class MainActivity :
         @JavascriptInterface
         fun stopNativeQrScanner() {
             activity.runOnUiThread { activity.stopNativeQrScannerSession() }
+        }
+
+        @JavascriptInterface
+        fun cacheChatAgents(json: String) {
+            activity.cacheChatAgentsFromJs(json)
         }
     }
 }
