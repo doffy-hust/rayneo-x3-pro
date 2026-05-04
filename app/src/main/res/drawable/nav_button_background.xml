@@ -7,6 +7,13 @@
         </shape>
     </item>
 
+    <!-- Voice: recording / listening session -->
+    <item android:state_selected="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#55E05060"/>
+        </shape>
+    </item>
+
     <!-- Hovered state - subtle blue highlight -->
     <item android:state_hovered="true">
         <shape android:shape="rectangle">

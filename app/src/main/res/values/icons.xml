@@ -21,6 +21,7 @@
     <string name="fa_rotate_right">&#xf2f9;</string>     <!-- Refresh -->
     <string name="fa_xmark">&#xf00d;</string>            <!-- Quit/Close -->
     <string name="fa_comment">&#xf075;</string>          <!-- Comment/Chat -->
+    <string name="fa_microphone">&#xf130;</string>        <!-- Voice / STT -->
     
     <!-- Font Awesome Brands (400) -->
     <string name="fa_youtube">&#xf167;</string>          <!-- YouTube -->

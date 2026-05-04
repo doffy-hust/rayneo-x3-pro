@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -29,6 +30,7 @@ import android.os.Looper
 import android.os.Parcel
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -60,6 +62,7 @@ import android.widget.ImageView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.core.content.FileProvider
 import androidx.core.content.edit
 import com.google.zxing.BarcodeFormat
@@ -128,7 +131,7 @@ class MainActivity :
     private lateinit var webView: WebView
     private lateinit var mainContainer: FrameLayout
     private lateinit var gestureDetector: GestureDetector
-    private lateinit var templeDoubleTapDetector: GestureDetector
+    private lateinit var templeTouchVoiceHelper: TempleTouchVoiceHelper
     private var isSimulatingTouchEvent = false
     private var isCursorVisible = true
     private var isMouseTapMode = false
@@ -279,6 +282,7 @@ class MainActivity :
     private val defaultQrZoomRatio = 3.0
     private var audioManager: AudioManager? = null
     private var speechRecognizer: SpeechRecognizer? = null
+    private lateinit var voiceInputController: VoiceInputController
     private lateinit var credentialStore: CredentialStore
     private lateinit var cameraManager: CameraManager
     private var cameraDevice: CameraDevice? = null
@@ -377,6 +381,10 @@ class MainActivity :
     private var tapCount = 0
     private val TAP_INTERVAL = 400L // Max time between consecutive taps
     private val TRIPLE_TAP_DURATION = 800L // Max time for entire 3-tap sequence
+    /** RayNeo+Groq: 4th tap cancels deferred voice and toggles scroll/cursor instead. */
+    private val QUADRUPLE_TAP_DURATION = 1400L
+    private val RAYNEO_TRIPLE_VOICE_DEFER_MS = 420L
+    private var rayNeoTripleVoiceDeferRunnable: Runnable? = null
     private var isTripleTapInProgress = false
     private var suppressTouchDispatchUntil = 0L
     private var pendingConversationFillText: String? = null
@@ -384,6 +392,12 @@ class MainActivity :
     private var wakeWordArmed = false
     private var lastSpeechPreviewToastAt = 0L
     private var awaitingSpeechReady = false
+    // Increments each listen attempt so stale readiness timeouts cannot fire late.
+    private var speechReadyTimeoutGeneration = 0
+    /** True once we showed "Listening..." for this attempt (any of ready / beginning / partial). */
+    private var speechListenUiNotified = false
+    /** Count sessions where recognizer silently never returned app callbacks. */
+    private var speechSilentSessionFailures = 0
 
     private var settingsMenu: View? = null
 
@@ -580,6 +594,8 @@ class MainActivity :
                                 // Triple tap detection for mode toggle/re-centering
                                 val currentTime = e.eventTime
                                 if (currentTime - lastTapTime > TAP_INTERVAL) {
+                                    rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                    rayNeoTripleVoiceDeferRunnable = null
                                     DebugLog.d("TripleTapDebug", "Starting new tap sequence")
                                     tapCount = 1
                                     firstTapTime = currentTime
@@ -593,33 +609,102 @@ class MainActivity :
                                 }
                                 lastTapTime = currentTime
 
-                                // Check for triple tap
-                                if (tapCount == 3 &&
-                                                (currentTime - firstTapTime) <= TRIPLE_TAP_DURATION
-                                ) {
+                                val inTripleWindow =
+                                        (currentTime - firstTapTime) <= TRIPLE_TAP_DURATION
+                                val inQuadWindow =
+                                        (currentTime - firstTapTime) <= QUADRUPLE_TAP_DURATION
+
+                                // RayNeo + Groq: temple often shares the main touch device — triple-tap
+                                // used to toggle cursor/scroll here and blocked voice. Defer 3rd tap
+                                // so a 4th tap can still mean "mode"; if no 4th tap, start voice.
+                                if (useRayNeoTripleTapVoiceForSharedTouch()) {
+                                    if (tapCount == 4 && inQuadWindow) {
+                                        rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                        rayNeoTripleVoiceDeferRunnable = null
+                                        DebugLog.d(
+                                                "TripleTapDebug",
+                                                "Quadruple tap (mode): ${currentTime - firstTapTime}ms"
+                                        )
+                                        doubleTapRunnable?.let { handler.removeCallbacks(it) }
+                                        doubleTapRunnable = null
+                                        isTripleTapInProgress = true
+                                        suppressTouchDispatchUntil =
+                                                SystemClock.uptimeMillis() + 250L
+                                        tapCount = 0
+
+                                        if (isAnchored) {
+                                            shouldResetInitialQuaternion = true
+                                            dualWebViewGroup.updateLeftEyePosition(
+                                                    0f,
+                                                    0f,
+                                                    0f
+                                            )
+                                            dualWebViewGroup.showToast("Screen Re-centered")
+                                        } else {
+                                            if (dualWebViewGroup.isInScrollMode()) {
+                                                toggleCursorVisibility(forceShow = true)
+                                                dualWebViewGroup.showToast("Cursor mode activated")
+                                            } else {
+                                                toggleCursorVisibility(forceHide = true)
+                                                dualWebViewGroup.showToast(
+                                                        "Scroll mode — quadruple-tap again to switch"
+                                                )
+                                            }
+                                        }
+                                        return true
+                                    }
+                                    if (tapCount == 3 && inTripleWindow) {
+                                        DebugLog.d(
+                                                "TripleTapDebug",
+                                                "Triple tap: defer voice (${currentTime - firstTapTime}ms)"
+                                        )
+                                        doubleTapRunnable?.let { handler.removeCallbacks(it) }
+                                        doubleTapRunnable = null
+                                        rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                        rayNeoTripleVoiceDeferRunnable = Runnable {
+                                            rayNeoTripleVoiceDeferRunnable = null
+                                            if (tapCount == 3) {
+                                                isTripleTapInProgress = true
+                                                suppressTouchDispatchUntil =
+                                                        SystemClock.uptimeMillis() + 250L
+                                                tapCount = 0
+                                                dualWebViewGroup.showToast(
+                                                        "Listening… Triple-tap again or Voice bar to stop.",
+                                                        4200L
+                                                )
+                                                requestVoiceRoutingSession(
+                                                        suppressRecordingHintToast = true
+                                                )
+                                            }
+                                        }
+                                        handler.postDelayed(
+                                                rayNeoTripleVoiceDeferRunnable!!,
+                                                RAYNEO_TRIPLE_VOICE_DEFER_MS
+                                        )
+                                        return true
+                                    }
+                                } else if (tapCount == 3 && inTripleWindow) {
                                     DebugLog.d(
                                             "TripleTapDebug",
                                             "Triple tap detected! Time from first tap: ${currentTime - firstTapTime}ms"
                                     )
-                                    // Explicitly cancel the specific double tap runnable
                                     doubleTapRunnable?.let { handler.removeCallbacks(it) }
                                     doubleTapRunnable = null
 
                                     handler.removeCallbacksAndMessages(null)
                                     isTripleTapInProgress = true
-                                    suppressTouchDispatchUntil = SystemClock.uptimeMillis() + 250L
+                                    suppressTouchDispatchUntil =
+                                            SystemClock.uptimeMillis() + 250L
 
                                     if (isAnchored) {
-                                        // Reset translations to center the view
                                         shouldResetInitialQuaternion = true
                                         dualWebViewGroup.updateLeftEyePosition(
                                                 0f,
                                                 0f,
                                                 0f
-                                        ) // Reset translations and rotation
+                                        )
                                         dualWebViewGroup.showToast("Screen Re-centered")
                                     } else {
-                                        // Non-anchored triple tap: toggle scroll/cursor mode
                                         if (dualWebViewGroup.isInScrollMode()) {
                                             toggleCursorVisibility(forceShow = true)
                                             dualWebViewGroup.showToast("Cursor mode activated")
@@ -638,6 +723,8 @@ class MainActivity :
 
                             override fun onLongPress(e: MotionEvent) {
                                 tapCount = 0
+                                rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                rayNeoTripleVoiceDeferRunnable = null
                                 DebugLog.d(
                                         "RingInput",
                                         """
@@ -659,6 +746,8 @@ class MainActivity :
                             ): Boolean {
                                 tapCount = 0 // Reset tap count on scroll to prevent accidental
                                 // triple-tap detection
+                                rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                rayNeoTripleVoiceDeferRunnable = null
                                 totalScrollDistance +=
                                         kotlin.math.sqrt(
                                                 distanceX * distanceX + distanceY * distanceY
@@ -1020,22 +1109,8 @@ class MainActivity :
 
                                 DebugLog.d(
                                         "DoubleTapDebug",
-                                        "Double tap detected, starting voice listening"
+                                        "Double tap consumed (no voice — use in-app Voice/AIZ; avoids Mercury launcher takeover on RayNeo)"
                                 )
-                                startNativeVoiceListening()
-                                return true
-                            }
-                        }
-                )
-
-        templeDoubleTapDetector =
-                GestureDetector(
-                        this,
-                        object : SimpleOnGestureListener() {
-                            override fun onDown(e: MotionEvent): Boolean = true
-
-                            override fun onDoubleTap(e: MotionEvent): Boolean {
-                                toggleMouseTapMode()
                                 return true
                             }
                         }
@@ -1078,6 +1153,33 @@ class MainActivity :
                         this@MainActivity.onMicrophonePressed()
                     }
                 }
+
+        voiceInputController = createVoiceInputController()
+
+        dualWebViewGroup.voiceRoutingListener = { requestVoiceRoutingSession() }
+
+        templeTouchVoiceHelper =
+                TempleTouchVoiceHelper(
+                        context = this,
+                        shouldHandleVoiceHold = {
+                            ::voiceInputController.isInitialized &&
+                                    voiceInputController.supportsTempleHoldToTalk()
+                        },
+                        onHoldThresholdPassed = {
+                            runOnUiThread {
+                                dualWebViewGroup.showToast(
+                                        "Listening… Release temple to send.",
+                                        4500L
+                                )
+                                requestVoiceRoutingSession(suppressRecordingHintToast = true)
+                            }
+                        },
+                        onHoldReleased = { finishTempleHoldVoiceSession() },
+                        onTempleDoubleTapMouse = {
+                            runOnUiThread { toggleMouseTapMode() }
+                        },
+                        onTripleTapVoiceToggle = { runOnUiThread { templeTripleTapVoiceToggle() } },
+                )
 
         // Cursor views setup
         // Set up the cursor views directly in the main container
@@ -1390,6 +1492,7 @@ class MainActivity :
 
         // Save window state on pause (app background/exit)
         dualWebViewGroup.saveAllWindowsState()
+        // Disabled for now: always-on wake loop was causing noisy auto-detected transcripts.
     }
 
     override fun onResume() {
@@ -1419,6 +1522,7 @@ class MainActivity :
                 )
             }
         }
+        // Disabled for now: always-on wake loop was causing noisy auto-detected transcripts.
     }
 
     fun getLastLocation(): Pair<Double, Double>? {
@@ -1856,28 +1960,59 @@ class MainActivity :
         return streamingDomains.any { url.contains(it, ignoreCase = true) }
     }
 
-    private fun initializeSpeechRecognition() {
+    /**
+     * Some OEM engines (including RayNeo) never call [RecognitionListener.onReadyForSpeech] but
+     * still work via [RecognitionListener.onBeginningOfSpeech] or [onPartialResults]. Treat those
+     * as "ready" so we do not cancel the session and burn retries.
+     */
+    private fun notifyRecognizedListeningStarted(source: String) {
+        runOnUiThread {
+            if (!speechListenUiNotified) {
+                speechListenUiNotified = true
+                dualWebViewGroup.showToast("Listening... speak now")
+                DebugLog.d("SpeechRecognition", "Session active ($source)")
+            }
+            speechSilentSessionFailures = 0
+            isListeningForSpeech = true
+            awaitingSpeechReady = false
+        }
+    }
+
+    private fun initializeSpeechRecognition(useConfiguredRecognitionService: Boolean = true) {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             DebugLog.w("SpeechRecognition", "Speech recognition not available on this device")
             return
         }
 
         try {
+            val recognizerComponent =
+                    if (useConfiguredRecognitionService) getConfiguredRecognitionService()
+                    else null
+            DebugLog.d(
+                    "SpeechRecognition",
+                    "Creating SpeechRecognizer with component: ${recognizerComponent?.flattenToShortString() ?: "default"}"
+            )
             speechRecognizer =
-                    SpeechRecognizer.createSpeechRecognizer(this).apply {
+                    (recognizerComponent?.let { SpeechRecognizer.createSpeechRecognizer(this, it) }
+                                    ?: SpeechRecognizer.createSpeechRecognizer(this))
+                            .apply {
                         setRecognitionListener(
                                 object : RecognitionListener {
                                     override fun onReadyForSpeech(params: Bundle?) {
-                                        isListeningForSpeech = true
-                                        awaitingSpeechReady = false
-                                        dualWebViewGroup.showToast("Listening... speak now")
+                                        notifyRecognizedListeningStarted("onReadyForSpeech")
                                     }
 
-                                    override fun onBeginningOfSpeech() {}
+                                    override fun onBeginningOfSpeech() {
+                                        notifyRecognizedListeningStarted("onBeginningOfSpeech")
+                                    }
 
                                     override fun onRmsChanged(rmsdB: Float) {}
 
-                                    override fun onBufferReceived(buffer: ByteArray?) {}
+                                    override fun onBufferReceived(buffer: ByteArray?) {
+                                        if (buffer != null && buffer.isNotEmpty()) {
+                                            notifyRecognizedListeningStarted("onBufferReceived")
+                                        }
+                                    }
 
                                     override fun onEndOfSpeech() {
                                         isListeningForSpeech = false
@@ -1886,6 +2021,7 @@ class MainActivity :
                                     override fun onError(error: Int) {
                                         isListeningForSpeech = false
                                         awaitingSpeechReady = false
+                                        speechSilentSessionFailures = 0
                                         val errorMsg =
                                                 when (error) {
                                                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
@@ -1894,6 +2030,16 @@ class MainActivity :
                                                             "No match found"
                                                     SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
                                                             "Recognizer busy"
+                                                    SpeechRecognizer.ERROR_AUDIO ->
+                                                            "Audio recording error"
+                                                    SpeechRecognizer.ERROR_CLIENT ->
+                                                            "Recognizer client error"
+                                                    SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
+                                                            "Network timeout"
+                                                    SpeechRecognizer.ERROR_NETWORK ->
+                                                            "Network error"
+                                                    SpeechRecognizer.ERROR_SERVER ->
+                                                            "Server error"
                                                     SpeechRecognizer
                                                             .ERROR_INSUFFICIENT_PERMISSIONS ->
                                                             "Permission denied"
@@ -1931,6 +2077,7 @@ class MainActivity :
                                                         ?.trim()
                                                         .orEmpty()
                                         if (partialText.isBlank()) return
+                                        notifyRecognizedListeningStarted("onPartialResults")
                                         val now = SystemClock.uptimeMillis()
                                         if (now - lastSpeechPreviewToastAt < 450L) return
                                         lastSpeechPreviewToastAt = now
@@ -1947,6 +2094,29 @@ class MainActivity :
             DebugLog.e("SpeechRecognition", "Failed to create SpeechRecognizer", e)
             speechRecognizer = null
         }
+    }
+
+    private fun recreateSpeechRecognizer(useConfiguredRecognitionService: Boolean) {
+        try {
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
+        initializeSpeechRecognition(useConfiguredRecognitionService)
+    }
+
+    /** Phase → (use configured RecognitionService from Settings, glasses assistant mic routing). */
+    private fun speechListenPhaseConfig(phase: Int): Pair<Boolean, Boolean> {
+        val p = phase.coerceIn(0, speechListenAttemptCount - 1)
+        val glassesMic = p % 2 == 1
+        val configured = (p / 2) % 2 == 0
+        return Pair(configured, glassesMic)
+    }
+
+    private fun getConfiguredRecognitionService(): ComponentName? {
+        val flattened =
+                Settings.Secure.getString(contentResolver, "voice_recognition_service")
+                        ?: return null
+        return ComponentName.unflattenFromString(flattened)
     }
 
     fun hideCustomKeyboard() {
@@ -2107,6 +2277,59 @@ class MainActivity :
         runOnUiThread { moveCursor(1) }
     }
 
+    private fun createVoiceInputController(): VoiceInputController {
+        val groqAudioService = GroqAudioService(this)
+        if (groqAudioService.hasApiKey()) {
+            DebugLog.d(
+                    "SpeechRecognition",
+                    "Using Groq STT voice backend (key present; RayNeo-like=${isLikelyRayNeoDevice})"
+            )
+            return GroqVoiceInputController(
+                    groqAudioService = groqAudioService,
+                    onToast = { message, durationMs ->
+                        runOnUiThread { dualWebViewGroup.showToast(message, durationMs) }
+                    },
+                    onTranscript = { text, armWakeRouting ->
+                        runOnUiThread {
+                            wakeWordArmed = armWakeRouting
+                            handleVoiceResult(text)
+                        }
+                    },
+                    onRecordingUiActive = { active ->
+                        runOnUiThread { dualWebViewGroup.setVoiceRecordingIndicator(active) }
+                    }
+            )
+        }
+        if (isLikelyRayNeoDevice) {
+            DebugLog.w("SpeechRecognition", "RayNeo-like device: missing GROQ API key; voice unavailable")
+            return UnavailableVoiceInputController { message ->
+                runOnUiThread { dualWebViewGroup.showToast(message) }
+            }
+        }
+
+        return object : VoiceInputController {
+            override fun startListening(armWakeRouting: Boolean, options: VoiceListenOptions) {
+                startNativeVoiceListening(
+                        armWakeRouting = armWakeRouting,
+                        retryPhase = options.retryPhase,
+                        showTriggerToast = options.showTriggerToast,
+                        isSecondPassAfterWake = options.isSecondPassAfterWake
+                )
+            }
+
+            override fun isActivelyRecording(): Boolean = isListeningForSpeech
+
+            override fun supportsTempleHoldToTalk(): Boolean = false
+
+            override fun release() {
+                try {
+                    speechRecognizer?.destroy()
+                } catch (_: Exception) {}
+                speechRecognizer = null
+            }
+        }
+    }
+
     private var isListeningForSpeech = false
     private var lastMicPressTime = 0L
     private val dashboardRouteUrl = "https://agentz-demo.aizcorp.vn/cognition/dashboards"
@@ -2114,8 +2337,56 @@ class MainActivity :
     private val wakeWordPattern = Regex("""(?i)\bhey\s*aiz\b""")
     private val conversationPayloadPrefixPattern =
             Regex(
-                    """(?i)^\s*(hey\s*aiz\s*)?(open|go\s*to|change\s*to|show|mở|mo|chuyển\s*sang|chuyen\s*sang|đi\s*đến|di\s*den)?\s*(conversation|conversations|chat|hội\s*thoại|hoi\s*thoai|cuộc\s*trò\s*chuyện|cuoc\s*tro\s*chuyen)\s*[:,-]?\s*"""
+                    """(?i)^\s*((hey\s+)?aiz\s*)?(open|go\s*to|change\s*to|show|mở|mo|chuyển\s*sang|chuyen\s*sang|đi\s*đến|di\s*den)?\s*(conversation|conversations|chat|hội\s*thoại|hoi\s*thoai|cuộc\s*trò\s*chuyện|cuoc\s*tro\s*chuyen)\s*[:,-]?\s*"""
             )
+
+    /**
+     * RayNeo / bundled RecognitionService often needs several seconds before [onReadyForSpeech].
+     * Short timeouts and fast retries produced false "engine not responding" failures.
+     */
+    private val speechListenAttemptCount = 6
+    private val rayNeoSpeechListenAttemptCount = 2
+
+    private val isLikelyRayNeoDevice: Boolean
+        get() {
+            val fingerprint =
+                    "${Build.MANUFACTURER} ${Build.BRAND} ${Build.MODEL}".lowercase(Locale.US)
+            val configuredService = getConfiguredRecognitionService()?.flattenToShortString().orEmpty()
+            return fingerprint.contains("rayneo") ||
+                    fingerprint.contains("ffalcon") ||
+                    fingerprint.contains("ffa") ||
+                    fingerprint.contains("x3") ||
+                    configuredService.startsWith("com.rayneo.live.ai/", ignoreCase = true)
+        }
+
+    /**
+     * When the ring/temple share one [InputDevice], triple-tap in [gestureDetector] is remapped:
+     * 3 taps (after short delay) → voice, 4 taps in window → scroll/cursor/anchor behavior.
+     */
+    private fun useRayNeoTripleTapVoiceForSharedTouch(): Boolean {
+        if (!isLikelyRayNeoDevice) return false
+        if (!::voiceInputController.isInitialized) return false
+        return voiceInputController.supportsTempleHoldToTalk()
+    }
+
+    private val speechReadyTimeoutMs: Long
+        get() =
+                when {
+                    isLikelyRayNeoDevice -> 8_000L
+                    else -> 8_000L
+                }
+
+    private fun speechListenAttemptLimit(): Int =
+            if (isLikelyRayNeoDevice) rayNeoSpeechListenAttemptCount else speechListenAttemptCount
+
+    private fun isSpeechRecognizerBlockedForSession(): Boolean =
+            isLikelyRayNeoDevice && speechSilentSessionFailures > 0
+
+    private fun speechStartListenDelayMs(retryPhase: Int): Long =
+            320L + retryPhase.coerceAtLeast(0) * 140L
+
+    private fun speechListenRetryBackoffMs(retryPhase: Int): Long =
+            400L + retryPhase.coerceAtLeast(0) * 220L
 
     private fun setVoiceAssistantAudioRoute(enabled: Boolean) {
         val value = if (enabled) "voiceassistant" else "off"
@@ -2146,12 +2417,94 @@ class MainActivity :
                 "onMicrophonePressed called, isListening: $isListeningForSpeech"
         )
         // Keyboard mic is for text input, not wake/routing
-        startNativeVoiceListening(armWakeRouting = false)
+        voiceInputController.startListening(
+                armWakeRouting = false,
+                VoiceListenOptions(showTriggerToast = true, isSecondPassAfterWake = false)
+        )
     }
 
-    private fun startNativeVoiceListening(armWakeRouting: Boolean = true) {
+    private fun requestVoiceRoutingSession(suppressRecordingHintToast: Boolean = false) {
         runOnUiThread {
-            dualWebViewGroup.showToast("Voice trigger received")
+            if (!hasWindowFocus() || !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                dualWebViewGroup.showToast("Return to the app, then use Voice")
+                return@runOnUiThread
+            }
+            voiceInputController.startListening(
+                    armWakeRouting = true,
+                    VoiceListenOptions(
+                            showTriggerToast = false,
+                            isSecondPassAfterWake = false,
+                            suppressRecordingHintToast = suppressRecordingHintToast
+                    )
+            )
+        }
+    }
+
+    /** Release finger after temple hold-to-talk: stop capture if Groq is still recording. */
+    private fun finishTempleHoldVoiceSession() {
+        runOnUiThread {
+            if (!voiceInputController.isActivelyRecording()) return@runOnUiThread
+            voiceInputController.startListening(
+                    armWakeRouting = true,
+                    VoiceListenOptions(
+                            showTriggerToast = false,
+                            isSecondPassAfterWake = false
+                    )
+            )
+        }
+    }
+
+    /**
+     * Short taps on the temple (e.g. triple-tap) — toggles Groq when hold is blocked by firmware.
+     */
+    private fun templeTripleTapVoiceToggle() {
+        if (!::voiceInputController.isInitialized) return
+        if (!voiceInputController.supportsTempleHoldToTalk()) {
+            dualWebViewGroup.showToast(
+                    "Temple voice needs GROQ_API_KEY in local.properties (rebuild).",
+                    2800L
+            )
+            return
+        }
+        if (!hasWindowFocus() || !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            dualWebViewGroup.showToast("Return to the app, then use Voice")
+            return
+        }
+        dualWebViewGroup.showToast(
+                "Listening… Triple-tap temple again to stop.",
+                4500L
+        )
+        requestVoiceRoutingSession(suppressRecordingHintToast = true)
+    }
+
+    /**
+     * Temple strip: names vary (`cyttsp6_mt`, `cyttsp7`, …). Main pad is typically `cyttsp5`.
+     */
+    private fun isTempleTouchDevice(ev: MotionEvent): Boolean {
+        val name = ev.device?.name ?: InputDevice.getDevice(ev.deviceId)?.name ?: return false
+        val n = name.lowercase(Locale.US)
+        if (n.contains("cyttsp5")) return false
+        if (n.contains("temple")) return true
+        if (n.contains("cyttsp")) return true
+        return false
+    }
+
+    private fun startNativeVoiceListening(
+            armWakeRouting: Boolean = true,
+            retryPhase: Int = 0,
+            showTriggerToast: Boolean = true,
+            isSecondPassAfterWake: Boolean = false,
+    ) {
+        runOnUiThread {
+            if (retryPhase == 0 && isSpeechRecognizerBlockedForSession()) {
+                dualWebViewGroup.showToast(
+                        "RayNeo voice engine is unavailable for third-party apps in this session. Use keyboard or fallback STT."
+                )
+                return@runOnUiThread
+            }
+            if (showTriggerToast) {
+                dualWebViewGroup.showToast("Voice trigger received")
+            }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
                             PackageManager.PERMISSION_GRANTED
             ) {
@@ -2164,50 +2517,138 @@ class MainActivity :
                 )
                 return@runOnUiThread
             }
-            if (!::dualWebViewGroup.isInitialized || speechRecognizer == null) {
-                initializeSpeechRecognition()
-            }
-            if (speechRecognizer == null) {
-                dualWebViewGroup.showToast("Speech recognition unavailable")
+            if (!::dualWebViewGroup.isInitialized) {
+                dualWebViewGroup.showToast("UI not ready")
                 return@runOnUiThread
             }
+
+            val (useConfiguredRecognitionService, glassesAssistantMic) =
+                    speechListenPhaseConfig(retryPhase)
+            val attemptLimit = speechListenAttemptLimit()
+            dualWebViewGroup.showToast(
+                    when {
+                        isSecondPassAfterWake -> "Listening for command…"
+                        retryPhase == 0 -> "Starting voice listener..."
+                        else ->
+                                "Retrying voice (${retryPhase + 1}/$attemptLimit)..."
+                    }
+            )
+
+            recreateSpeechRecognizer(useConfiguredRecognitionService)
+            if (speechRecognizer == null) {
+                val lastPhase = attemptLimit - 1
+                if (retryPhase < lastPhase) {
+                    Handler(Looper.getMainLooper()).postDelayed(
+                            {
+                                startNativeVoiceListening(
+                                        armWakeRouting = armWakeRouting,
+                                        retryPhase = retryPhase + 1,
+                                        showTriggerToast = false,
+                                        isSecondPassAfterWake = isSecondPassAfterWake
+                                )
+                            },
+                            speechListenRetryBackoffMs(retryPhase)
+                    )
+                } else {
+                    dualWebViewGroup.showToast("Speech recognition unavailable")
+                }
+                return@runOnUiThread
+            }
+
             wakeWordArmed = armWakeRouting
+
+            speechReadyTimeoutGeneration++
+            val generation = speechReadyTimeoutGeneration
+            awaitingSpeechReady = true
+            isListeningForSpeech = false
+            speechListenUiNotified = false
+
+            setVoiceAssistantAudioRoute(glassesAssistantMic)
+
+            val preferredLanguage = Locale.getDefault().toLanguageTag().ifBlank { "en-US" }
+            val listenIntent =
+                    Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                        putExtra(
+                                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                        )
+                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, preferredLanguage)
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, preferredLanguage)
+                        putExtra(
+                                "android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES",
+                                arrayOf("en-US", "vi-VN")
+                        )
+                        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                    }
+
             try {
-                val preferredLanguage = Locale.getDefault().toLanguageTag().ifBlank { "en-US" }
-                setVoiceAssistantAudioRoute(true)
-                awaitingSpeechReady = true
-                isListeningForSpeech = false
-                dualWebViewGroup.showToast("Starting voice listener...")
-                speechRecognizer?.cancel()
-                speechRecognizer?.startListening(
-                        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                            putExtra(
-                                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-                            )
-                            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, preferredLanguage)
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, preferredLanguage)
-                            // Keep both common command languages available for recognition.
-                            putExtra(
-                                    "android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES",
-                                    arrayOf("en-US", "vi-VN")
-                            )
-                            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-                        }
-                )
+                val startDelay = speechStartListenDelayMs(retryPhase)
                 Handler(Looper.getMainLooper()).postDelayed(
                         {
-                            if (awaitingSpeechReady && !isListeningForSpeech) {
+                            if (generation != speechReadyTimeoutGeneration) return@postDelayed
+                            try {
+                                speechRecognizer?.startListening(listenIntent)
+                            } catch (e: Exception) {
                                 awaitingSpeechReady = false
-                                dualWebViewGroup.showToast("Recognizer not ready. Check mic/audio route.")
+                                DebugLog.e("SpeechRecognition", "startListening failed", e)
+                                dualWebViewGroup.showToast("Unable to start listening")
                             }
                         },
-                        1800
+                        startDelay
+                )
+
+                val readyTimeout = speechReadyTimeoutMs
+                Handler(Looper.getMainLooper()).postDelayed(
+                        {
+                            if (generation != speechReadyTimeoutGeneration) return@postDelayed
+                            if (awaitingSpeechReady && !isListeningForSpeech) {
+                                awaitingSpeechReady = false
+                                try {
+                                    speechRecognizer?.cancel()
+                                } catch (_: Exception) {}
+                                val lastPhase = attemptLimit - 1
+                                if (retryPhase < lastPhase) {
+                                    DebugLog.w(
+                                            "SpeechRecognition",
+                                            "No ready/beginning/partial callback within ${readyTimeout}ms (phase $retryPhase), retrying"
+                                    )
+                                    dualWebViewGroup.showToast("Recognizer not ready. Retrying...")
+                                    val nextPhase = retryPhase + 1
+                                    val backoff = speechListenRetryBackoffMs(retryPhase)
+                                    Handler(Looper.getMainLooper()).postDelayed(
+                                            {
+                                                startNativeVoiceListening(
+                                                        armWakeRouting = armWakeRouting,
+                                                        retryPhase = nextPhase,
+                                                        showTriggerToast = false,
+                                                        isSecondPassAfterWake =
+                                                                isSecondPassAfterWake
+                                                )
+                                            },
+                                            backoff
+                                    )
+                                } else {
+                                    speechSilentSessionFailures += 1
+                                    DebugLog.e(
+                                            "SpeechRecognition",
+                                            "Speech engine not ready after $attemptLimit attempts (~${readyTimeout}ms each), silentFailures=$speechSilentSessionFailures"
+                                    )
+                                    dualWebViewGroup.showToast(
+                                            if (isSpeechRecognizerBlockedForSession()) {
+                                                "RayNeo voice engine did not return callbacks. Use keyboard or fallback STT."
+                                            } else {
+                                                "Speech engine not responding. Check system voice input settings or use another STT path."
+                                            }
+                                    )
+                                }
+                            }
+                        },
+                        readyTimeout
                 )
                 pendingMicStartAfterPermission = false
             } catch (e: Exception) {
-                DebugLog.e("SpeechRecognition", "Failed to start native listening", e)
+                DebugLog.e("SpeechRecognition", "Failed to schedule native listening", e)
                 dualWebViewGroup.showToast("Unable to start listening")
                 isListeningForSpeech = false
                 awaitingSpeechReady = false
@@ -2216,34 +2657,67 @@ class MainActivity :
         }
     }
 
+    private fun stripWakeCommandPrefix(normalized: String): String {
+        var s = normalized.trim()
+        if (s.startsWith("hey ")) {
+            val afterHey = s.removePrefix("hey").trimStart()
+            s =
+                    if (afterHey.startsWith("aiz")) {
+                        afterHey.removePrefix("aiz").trimStart()
+                    } else {
+                        afterHey
+                    }
+        } else if (s.startsWith("aiz")) {
+            s = s.removePrefix("aiz").trimStart()
+        }
+        return s.trim()
+    }
+
+    private fun utteranceHasWakePrefix(normalized: String): Boolean {
+        if (wakeWordPattern.containsMatchIn(normalized)) return true
+        return normalized.startsWith("aiz")
+    }
+
     private fun handleVoiceResult(text: String) {
         if (text.isBlank()) return
 
         val trimmed = text.trim()
         val normalized = normalizeVoiceText(trimmed)
+        val afterWake = stripWakeCommandPrefix(normalized)
         val wakeWordOnly =
-                wakeWordPattern.containsMatchIn(trimmed) &&
-                        !containsRouteKeyword(normalized.removePrefix("hey aiz").trim())
+                utteranceHasWakePrefix(normalized) && !containsRouteKeyword(afterWake)
         if (wakeWordOnly) {
-            dualWebViewGroup.showToast("Wake word detected")
-            startNativeVoiceListening()
+            dualWebViewGroup.showToast("AIZ heard — say your command")
+            voiceInputController.startListening(
+                    armWakeRouting = true,
+                    VoiceListenOptions(
+                            showTriggerToast = false,
+                            isSecondPassAfterWake = true
+                    )
+            )
             return
         }
 
         val route = resolveRouteFromCommand(normalized)
         if (route == conversationRouteUrl) {
             pendingConversationFillText = extractConversationPayload(trimmed)
-            webView.loadUrl(conversationRouteUrl)
+            navigateRouteWithoutReload(
+                    routeUrl = conversationRouteUrl,
+                    payload = pendingConversationFillText
+            )
             wakeWordArmed = false
             return
         }
         if (route == dashboardRouteUrl) {
-            webView.loadUrl(dashboardRouteUrl)
+            navigateRouteWithoutReload(routeUrl = dashboardRouteUrl)
             wakeWordArmed = false
             return
         }
         if (wakeWordArmed) {
-            dualWebViewGroup.showToast("No route matched")
+            dualWebViewGroup.showToast(
+                    "Say where to go: dashboard, chat, or speak without wake for dictation.",
+                    3200L
+            )
             wakeWordArmed = false
             return
         }
@@ -2297,7 +2771,8 @@ class MainActivity :
 
     private fun resolveRouteFromCommand(normalized: String): String? {
         if (normalized.isBlank()) return null
-        val command = normalized.removePrefix("hey aiz").trim()
+        val command = stripWakeCommandPrefix(normalized)
+        if (command.isBlank()) return null
         val dashboardKeywords = listOf("dashboard", "bang dieu khien")
         if (dashboardKeywords.any { command.contains(it) }) return dashboardRouteUrl
         val conversationKeywords =
@@ -2309,6 +2784,74 @@ class MainActivity :
     private fun extractConversationPayload(rawText: String): String? {
         val value = rawText.replace(conversationPayloadPrefixPattern, "").trim()
         return value.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Prefer SPA-style route changes (no full page refresh). Falls back to loadUrl when the current
+     * page cannot be routed in-place.
+     */
+    private fun navigateRouteWithoutReload(routeUrl: String, payload: String? = null) {
+        val currentUrl = webView.url.orEmpty()
+        val current = runCatching { Uri.parse(currentUrl) }.getOrNull()
+        val target = runCatching { Uri.parse(routeUrl) }.getOrNull()
+        if (current == null || target == null) {
+            webView.loadUrl(routeUrl)
+            return
+        }
+
+        val sameOrigin =
+                current.scheme.equals(target.scheme, ignoreCase = true) &&
+                        current.host.equals(target.host, ignoreCase = true) &&
+                        current.port == target.port
+        if (!sameOrigin) {
+            webView.loadUrl(routeUrl)
+            return
+        }
+
+        val targetPath = target.encodedPath.orEmpty().ifBlank { "/" }
+        val targetQuery =
+                target.encodedQuery?.let { "?$it" }.orEmpty() + target.encodedFragment?.let { "#$it" }
+                        .orEmpty()
+        val targetRelative = "$targetPath$targetQuery"
+        val payloadJs =
+                payload?.let { "window.__taplinkPendingConversationPayload = ${JSONObject.quote(it)};" }
+                        ?: ""
+        val js =
+                """
+            (function() {
+                try {
+                    var target = ${JSONObject.quote(targetRelative)};
+                    if (!window.location || !window.history || !window.history.pushState) return 'fallback';
+                    if (window.location.pathname + window.location.search + window.location.hash === target) {
+                        return 'already-there';
+                    }
+                    $payloadJs
+                    window.history.pushState({}, '', target);
+                    window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+                    window.dispatchEvent(new Event('hashchange'));
+                    window.dispatchEvent(new CustomEvent('taplink:navigate', { detail: { target: target } }));
+                    return 'in-page';
+                } catch (e) {
+                    return 'fallback';
+                }
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(js) { result ->
+            val routedInPage =
+                    result?.contains("in-page") == true || result?.contains("already-there") == true
+            if (routedInPage) {
+                if (!payload.isNullOrBlank() && routeUrl.startsWith(conversationRouteUrl, ignoreCase = true)) {
+                    // SPA route targets may render chat input asynchronously; retry helper handles delays.
+                    webView.postDelayed(
+                            { maybeInjectPendingConversationInput(webView, conversationRouteUrl) },
+                            250L
+                    )
+                }
+            } else {
+                webView.loadUrl(routeUrl)
+            }
+        }
     }
 
     private fun moveCursor(offset: Int) {
@@ -4902,7 +5445,10 @@ class MainActivity :
                     if (audioGranted) {
                         val armWakeRouting = pendingMicArmWakeRouting
                         pendingMicStartAfterPermission = false
-                        startNativeVoiceListening(armWakeRouting = armWakeRouting)
+                        voiceInputController.startListening(
+                                armWakeRouting = armWakeRouting,
+                                VoiceListenOptions(showTriggerToast = true)
+                        )
                     } else {
                         pendingMicStartAfterPermission = false
                         dualWebViewGroup.showToast("Microphone permission denied")
@@ -5538,6 +6084,22 @@ class MainActivity :
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
+                KeyEvent.KEYCODE_HEADSETHOOK -> {
+                    if (::voiceInputController.isInitialized &&
+                                    voiceInputController.supportsTempleHoldToTalk()
+                    ) {
+                        if (hasWindowFocus() &&
+                                        lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+                        ) {
+                            dualWebViewGroup.showToast(
+                                    "Voice (headset key) — tap again or use bar to stop",
+                                    3500L
+                            )
+                            requestVoiceRoutingSession(suppressRecordingHintToast = true)
+                        }
+                        return true
+                    }
+                }
                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                     dualWebViewGroup.toggleMediaPlayback()
                     return true
@@ -5561,9 +6123,11 @@ class MainActivity :
             ensureMouseTapModeDisabled()
         }
 
-        // Temple arm input should only be used for mode-toggle double taps.
-        if (ev.device?.name == "cyttsp6_mt") {
-            templeDoubleTapDetector.onTouchEvent(ev)
+        // Temple arm only: hold / triple-tap → voice, delayed double-tap → mouse mode (not main pad).
+        if (isTempleTouchDevice(ev)) {
+            if (::templeTouchVoiceHelper.isInitialized) {
+                templeTouchVoiceHelper.onTouchEvent(ev)
+            }
             return true
         }
 
@@ -6011,8 +6575,14 @@ class MainActivity :
 
     override fun onDestroy() {
         super.onDestroy()
-        speechRecognizer?.destroy()
-        speechRecognizer = null
+        rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+        rayNeoTripleVoiceDeferRunnable = null
+        if (::templeTouchVoiceHelper.isInitialized) {
+            templeTouchVoiceHelper.reset()
+        }
+        if (::voiceInputController.isInitialized) {
+            voiceInputController.release()
+        }
         cameraDevice?.close()
         imageReader?.close()
         cameraThread?.quitSafely()

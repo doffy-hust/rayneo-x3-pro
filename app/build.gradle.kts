@@ -18,8 +18,10 @@ android {
     compileSdk = 36
     val rawLoginEmail = localProperties.getProperty("AIZ_LOGIN_EMAIL") ?: System.getenv("AIZ_LOGIN_EMAIL") ?: ""
     val rawLoginPassword = localProperties.getProperty("AIZ_LOGIN_PASSWORD") ?: System.getenv("AIZ_LOGIN_PASSWORD") ?: ""
+    val rawGroqApiKey = localProperties.getProperty("GROQ_API_KEY") ?: System.getenv("GROQ_API_KEY") ?: ""
     val loginEmail = rawLoginEmail.replace("\\", "\\\\").replace("\"", "\\\"")
     val loginPassword = rawLoginPassword.replace("\\", "\\\\").replace("\"", "\\\"")
+    val groqApiKey = rawGroqApiKey.replace("\\", "\\\\").replace("\"", "\\\"")
 
     defaultConfig {
         applicationId = "com.TapLinkX3.app"
@@ -29,6 +31,7 @@ android {
         versionName = "1.5.0"
         buildConfigField("String", "LOGIN_EMAIL", "\"$loginEmail\"")
         buildConfigField("String", "LOGIN_PASSWORD", "\"$loginPassword\"")
+        buildConfigField("String", "GROQ_API_KEY", "\"$groqApiKey\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -37,11 +40,11 @@ android {
         debug {
             applicationIdSuffix = ".debug"  // Add this line
             // Append .debug to the package name for debug builds
-            resValue("string", "app_name", "AIZ_DEV")
+            resValue("string", "app_name", "AIZ")
         }
 
         release {
-            resValue("string", "app_name", "AIZ_DEV")
+            resValue("string", "app_name", "AIZ")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

@@ -25,6 +25,7 @@ import android.util.AttributeSet
 import android.util.Base64
 import android.util.Log
 import android.view.GestureDetector
+import android.view.HapticFeedbackConstants
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
@@ -368,6 +369,9 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             }
         }
 
+    /** Tap Voice/AIZ nav or long-press chrome (toggle bar / Voice) to start routing STT on RayNeo. */
+    var voiceRoutingListener: (() -> Unit)? = null
+
     private var navButtons: Map<String, NavButton>
 
     var listener: DualWebViewGroupListener? = null
@@ -388,6 +392,22 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
     fun setChatMicActive(active: Boolean) {
         if (::chatView.isInitialized) {
             chatView.setMicActive(active)
+        }
+    }
+
+    /** Visual + haptic feedback while Groq is actively recording (Voice button). */
+    fun setVoiceRecordingIndicator(active: Boolean) {
+        post {
+            leftNavigationBar.findViewById<View>(R.id.btnVoice)?.apply {
+                val changed = isSelected != active
+                isSelected = active
+                if (changed) {
+                    performHapticFeedback(
+                            if (active) HapticFeedbackConstants.VIRTUAL_KEY
+                            else HapticFeedbackConstants.CONTEXT_CLICK
+                    )
+                }
+            }
         }
     }
 
@@ -2092,6 +2112,11 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                                 NavButton(
                                         left = leftNavigationBar.findViewById(R.id.btnChat),
                                         right = leftNavigationBar.findViewById(R.id.btnChat)
+                                ),
+                        "voice" to
+                                NavButton(
+                                        left = leftNavigationBar.findViewById(R.id.btnVoice),
+                                        right = leftNavigationBar.findViewById(R.id.btnVoice)
                                 )
                 )
 
@@ -2116,6 +2141,10 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             if (navButton.right !== navButton.left) {
                 navButton.right.setOnClickListener { triggerNavigationAction(key, navButton) }
             }
+        }
+        leftNavigationBar.findViewById<View>(R.id.btnVoice)?.setOnLongClickListener {
+            voiceRoutingListener?.invoke()
+            true
         }
 
         // Initialize left toggle bar
@@ -5641,6 +5670,10 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             toggleChat()
             return
         }
+        if (key == "voice") {
+            voiceRoutingListener?.invoke()
+            return
+        }
         navigationListener?.let { listener ->
             when (key) {
                 "back" -> listener.onNavigationBackPressed()
@@ -5985,6 +6018,12 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
             toggleWindowMode()
         }
         leftWindowsButton.visibility = View.GONE
+
+        leftToggleBar.isLongClickable = true
+        leftToggleBar.setOnLongClickListener {
+            voiceRoutingListener?.invoke()
+            true
+        }
     }
 
     fun isSettingsVisible(): Boolean {
@@ -7168,9 +7207,15 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                             Quadruple(
                                     "Voice Routing",
                                     """
-                VOICE ROUTING:
-                • Double tap anywhere to start listening.
-                • Or say "HEY AIZ" to wake routing mode.
+                VOICE ROUTING (RayNeo / Mercury):
+                • Temple long-press is often handled by the system first. With Groq: triple-tap on
+                  the touch surface starts voice (shared controller with the ring). For scroll/cursor
+                  or re-center, use four quick taps in the same window. Headset/hook key also starts
+                  voice when the OS delivers it. Dedicated temple strip (second touch device) keeps
+                  its own hold/triple/double rules.
+                • Use the Voice/AIZ button on the bottom bar, or long-press the Voice icon or the
+                  left tool strip, then speak.
+                • Say "hey AIZ" or start with "AIZ" (e.g. "AIZ open dashboard") to wake routing.
                 • Commands can open dashboard or conversation pages.
                 """.trimIndent(),
                                     false,
