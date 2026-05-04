@@ -380,11 +380,13 @@ class MainActivity :
     private var firstTapTime = 0L
     private var tapCount = 0
     private val TAP_INTERVAL = 400L // Max time between consecutive taps
-    private val TRIPLE_TAP_DURATION = 800L // Max time for entire 3-tap sequence
-    /** RayNeo+Groq: 4th tap cancels deferred voice and toggles scroll/cursor instead. */
-    private val QUADRUPLE_TAP_DURATION = 1400L
-    private val RAYNEO_TRIPLE_VOICE_DEFER_MS = 420L
-    private var rayNeoTripleVoiceDeferRunnable: Runnable? = null
+    private val TRIPLE_TAP_DURATION = 800L // Max time for entire 3-tap sequence (non-RayNeo mode)
+    /** RayNeo+Groq shared touch: max time from 1st tap to 2nd for double-tap → voice. */
+    private val RAYNEO_DOUBLE_VOICE_MAX_MS = 750L
+    /** RayNeo+Groq: 3rd tap cancels deferred voice and runs scroll/cursor / re-center. */
+    private val RAYNEO_MODE_TRIPLE_MAX_MS = 1200L
+    private val RAYNEO_DOUBLE_VOICE_DEFER_MS = 380L
+    private var rayNeoDoubleVoiceDeferRunnable: Runnable? = null
     private var isTripleTapInProgress = false
     private var suppressTouchDispatchUntil = 0L
     private var pendingConversationFillText: String? = null
@@ -594,8 +596,8 @@ class MainActivity :
                                 // Triple tap detection for mode toggle/re-centering
                                 val currentTime = e.eventTime
                                 if (currentTime - lastTapTime > TAP_INTERVAL) {
-                                    rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
-                                    rayNeoTripleVoiceDeferRunnable = null
+                                    rayNeoDoubleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                    rayNeoDoubleVoiceDeferRunnable = null
                                     DebugLog.d("TripleTapDebug", "Starting new tap sequence")
                                     tapCount = 1
                                     firstTapTime = currentTime
@@ -611,19 +613,20 @@ class MainActivity :
 
                                 val inTripleWindow =
                                         (currentTime - firstTapTime) <= TRIPLE_TAP_DURATION
-                                val inQuadWindow =
-                                        (currentTime - firstTapTime) <= QUADRUPLE_TAP_DURATION
+                                val inDoubleVoiceWindow =
+                                        (currentTime - firstTapTime) <= RAYNEO_DOUBLE_VOICE_MAX_MS
+                                val inModeTripleWindow =
+                                        (currentTime - firstTapTime) <= RAYNEO_MODE_TRIPLE_MAX_MS
 
-                                // RayNeo + Groq: temple often shares the main touch device — triple-tap
-                                // used to toggle cursor/scroll here and blocked voice. Defer 3rd tap
-                                // so a 4th tap can still mean "mode"; if no 4th tap, start voice.
-                                if (useRayNeoTripleTapVoiceForSharedTouch()) {
-                                    if (tapCount == 4 && inQuadWindow) {
-                                        rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
-                                        rayNeoTripleVoiceDeferRunnable = null
+                                // RayNeo + Groq: shared touch — double-tap defers voice; 3rd tap
+                                // cancels and toggles scroll/cursor (or re-center when anchored).
+                                if (useRayNeoDoubleTapVoiceForSharedTouch()) {
+                                    if (tapCount == 3 && inModeTripleWindow) {
+                                        rayNeoDoubleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                        rayNeoDoubleVoiceDeferRunnable = null
                                         DebugLog.d(
                                                 "TripleTapDebug",
-                                                "Quadruple tap (mode): ${currentTime - firstTapTime}ms"
+                                                "Triple tap (mode): ${currentTime - firstTapTime}ms"
                                         )
                                         doubleTapRunnable?.let { handler.removeCallbacks(it) }
                                         doubleTapRunnable = null
@@ -647,29 +650,29 @@ class MainActivity :
                                             } else {
                                                 toggleCursorVisibility(forceHide = true)
                                                 dualWebViewGroup.showToast(
-                                                        "Scroll mode — quadruple-tap again to switch"
+                                                        "Scroll mode — triple-tap again to switch"
                                                 )
                                             }
                                         }
                                         return true
                                     }
-                                    if (tapCount == 3 && inTripleWindow) {
+                                    if (tapCount == 2 && inDoubleVoiceWindow) {
                                         DebugLog.d(
                                                 "TripleTapDebug",
-                                                "Triple tap: defer voice (${currentTime - firstTapTime}ms)"
+                                                "Double tap: defer voice (${currentTime - firstTapTime}ms)"
                                         )
                                         doubleTapRunnable?.let { handler.removeCallbacks(it) }
                                         doubleTapRunnable = null
-                                        rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
-                                        rayNeoTripleVoiceDeferRunnable = Runnable {
-                                            rayNeoTripleVoiceDeferRunnable = null
-                                            if (tapCount == 3) {
+                                        rayNeoDoubleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                        rayNeoDoubleVoiceDeferRunnable = Runnable {
+                                            rayNeoDoubleVoiceDeferRunnable = null
+                                            if (tapCount == 2) {
                                                 isTripleTapInProgress = true
                                                 suppressTouchDispatchUntil =
                                                         SystemClock.uptimeMillis() + 250L
                                                 tapCount = 0
                                                 dualWebViewGroup.showToast(
-                                                        "Listening… Triple-tap again or Voice bar to stop.",
+                                                        "Listening… Double-tap again or Voice bar to stop.",
                                                         4200L
                                                 )
                                                 requestVoiceRoutingSession(
@@ -678,8 +681,8 @@ class MainActivity :
                                             }
                                         }
                                         handler.postDelayed(
-                                                rayNeoTripleVoiceDeferRunnable!!,
-                                                RAYNEO_TRIPLE_VOICE_DEFER_MS
+                                                rayNeoDoubleVoiceDeferRunnable!!,
+                                                RAYNEO_DOUBLE_VOICE_DEFER_MS
                                         )
                                         return true
                                     }
@@ -723,8 +726,8 @@ class MainActivity :
 
                             override fun onLongPress(e: MotionEvent) {
                                 tapCount = 0
-                                rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
-                                rayNeoTripleVoiceDeferRunnable = null
+                                rayNeoDoubleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                rayNeoDoubleVoiceDeferRunnable = null
                                 DebugLog.d(
                                         "RingInput",
                                         """
@@ -746,8 +749,8 @@ class MainActivity :
                             ): Boolean {
                                 tapCount = 0 // Reset tap count on scroll to prevent accidental
                                 // triple-tap detection
-                                rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
-                                rayNeoTripleVoiceDeferRunnable = null
+                                rayNeoDoubleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+                                rayNeoDoubleVoiceDeferRunnable = null
                                 totalScrollDistance +=
                                         kotlin.math.sqrt(
                                                 distanceX * distanceX + distanceY * distanceY
@@ -2360,10 +2363,10 @@ class MainActivity :
         }
 
     /**
-     * When the ring/temple share one [InputDevice], triple-tap in [gestureDetector] is remapped:
-     * 3 taps (after short delay) → voice, 4 taps in window → scroll/cursor/anchor behavior.
+     * When the ring/temple share one [InputDevice], [gestureDetector] remaps taps: double-tap
+     * (after short defer) starts voice; a 3rd tap in window cancels and runs scroll/cursor / re-center.
      */
-    private fun useRayNeoTripleTapVoiceForSharedTouch(): Boolean {
+    private fun useRayNeoDoubleTapVoiceForSharedTouch(): Boolean {
         if (!isLikelyRayNeoDevice) return false
         if (!::voiceInputController.isInitialized) return false
         return voiceInputController.supportsTempleHoldToTalk()
@@ -6575,8 +6578,8 @@ class MainActivity :
 
     override fun onDestroy() {
         super.onDestroy()
-        rayNeoTripleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
-        rayNeoTripleVoiceDeferRunnable = null
+        rayNeoDoubleVoiceDeferRunnable?.let { handler.removeCallbacks(it) }
+        rayNeoDoubleVoiceDeferRunnable = null
         if (::templeTouchVoiceHelper.isInitialized) {
             templeTouchVoiceHelper.reset()
         }

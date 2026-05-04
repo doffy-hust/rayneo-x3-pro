@@ -7208,11 +7208,10 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                                     "Voice Routing",
                                     """
                 VOICE ROUTING (RayNeo / Mercury):
-                • Temple long-press is often handled by the system first. With Groq: triple-tap on
-                  the touch surface starts voice (shared controller with the ring). For scroll/cursor
-                  or re-center, use four quick taps in the same window. Headset/hook key also starts
-                  voice when the OS delivers it. Dedicated temple strip (second touch device) keeps
-                  its own hold/triple/double rules.
+                • Temple long-press is often handled by the system first. With Groq on a shared touch
+                  surface: double-tap starts voice (brief pause after 2nd tap); add a third tap in
+                  time for scroll/cursor or re-center instead. Headset/hook key can start voice.
+                  A second touch device (temple strip) may still use triple-tap there.
                 • Use the Voice/AIZ button on the bottom bar, or long-press the Voice icon or the
                   left tool strip, then speak.
                 • Say "hey AIZ" or start with "AIZ" (e.g. "AIZ open dashboard") to wake routing.

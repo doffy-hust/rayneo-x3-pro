@@ -205,7 +205,7 @@ class GroqVoiceInputController(
                                         !lastListenOptions.suppressRecordingHintToast
                         ) {
                             toast(
-                                    "Listening… Tap Voice or temple again when you're done.",
+                                    "Listening… Tap Voice or double-tap surface again when you're done.",
                                     TOAST_LISTENING_MS
                             )
                         }
