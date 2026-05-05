@@ -55,9 +55,15 @@ class GroqVoiceInputController(
     private var pendingArmWakeRouting = true
     private var wakeLoopEnabled = false
     private var wakeChunkInFlight = false
+    private var manualCaptureActive = false
+    private var manualSpeechStarted = false
+    private var manualLastVoiceAt = 0L
+    private var manualFirstSpeechAt = 0L
+    private var manualCaptureStartedAt = 0L
     private var commandCaptureActive = false
     private var commandSpeechStarted = false
     private var commandLastVoiceAt = 0L
+    private var commandFirstSpeechAt = 0L
     private var lastListenOptions = VoiceListenOptions()
 
     override fun isActivelyRecording(): Boolean = groqAudioService.isRecording()
@@ -68,14 +74,21 @@ class GroqVoiceInputController(
         lastListenOptions = options
         pendingArmWakeRouting = armWakeRouting
         if (groqAudioService.isRecording()) {
-            groqAudioService.stopRecordingAndTranscribe()
+            toast("Listening. Stop speaking for 1-2 seconds.", TOAST_SHORT_MS)
             return
         }
         if (!groqAudioService.hasApiKey()) {
             toast("Add GROQ_API_KEY in local.properties, rebuild, then try Voice again.")
             return
         }
+        resetManualCaptureState()
+        manualCaptureActive = true
+        manualSpeechStarted = false
+        manualLastVoiceAt = 0L
+        manualFirstSpeechAt = 0L
+        manualCaptureStartedAt = SystemClock.uptimeMillis()
         groqAudioService.startRecording()
+        monitorManualSilence()
     }
 
     override fun startForegroundWakeListening() {
@@ -87,9 +100,10 @@ class GroqVoiceInputController(
     override fun stopForegroundWakeListening() {
         wakeLoopEnabled = false
         wakeChunkInFlight = false
-        commandCaptureActive = false
-        commandSpeechStarted = false
+        resetManualCaptureState()
+        resetCommandCaptureState()
         uiHandler.removeCallbacksAndMessages(WAKE_TOKEN)
+        uiHandler.removeCallbacksAndMessages(MANUAL_TOKEN)
         if (groqAudioService.isRecording()) {
             groqAudioService.cancelRecording()
         }
@@ -119,15 +133,61 @@ class GroqVoiceInputController(
     }
 
     private fun startCommandCaptureAfterWake() {
+        resetCommandCaptureState()
         commandCaptureActive = true
-        commandSpeechStarted = false
-        commandLastVoiceAt = 0L
         pendingArmWakeRouting = true
         toast("Heard \"AIZ\" — say your command, then pause.")
         if (!groqAudioService.isRecording()) {
             groqAudioService.startRecording()
         }
         monitorCommandSilence()
+    }
+
+    private fun monitorManualSilence() {
+        uiHandler.postAtTime(
+                {
+                    if (!manualCaptureActive || !groqAudioService.isRecording()) return@postAtTime
+                    val amp = groqAudioService.currentAmplitude()
+                    val now = SystemClock.uptimeMillis()
+                    if (amp >= MANUAL_AMPLITUDE_VOICE_THRESHOLD) {
+                        if (!manualSpeechStarted) {
+                            manualSpeechStarted = true
+                            manualFirstSpeechAt = now
+                        }
+                        manualLastVoiceAt = now
+                    }
+                    if (manualSpeechStarted &&
+                                    manualLastVoiceAt > 0L &&
+                                    now - manualLastVoiceAt >= MANUAL_SILENCE_STOP_MS
+                    ) {
+                        resetManualCaptureState()
+                        toast("Transcribing…", TOAST_SHORT_MS)
+                        groqAudioService.stopRecordingAndTranscribe()
+                        return@postAtTime
+                    }
+                    if (manualSpeechStarted &&
+                                    manualFirstSpeechAt > 0L &&
+                                    now - manualFirstSpeechAt >= MANUAL_MAX_AFTER_SPEECH_MS
+                    ) {
+                        resetManualCaptureState()
+                        toast("Transcribing…", TOAST_SHORT_MS)
+                        groqAudioService.stopRecordingAndTranscribe()
+                        return@postAtTime
+                    }
+                    if (!manualSpeechStarted &&
+                                    manualCaptureStartedAt > 0L &&
+                                    now - manualCaptureStartedAt >= MANUAL_NO_SPEECH_STOP_MS
+                    ) {
+                        resetManualCaptureState()
+                        toast("No speech detected.", TOAST_SHORT_MS)
+                        groqAudioService.stopRecordingAndTranscribe()
+                        return@postAtTime
+                    }
+                    monitorManualSilence()
+                },
+                MANUAL_TOKEN,
+                SystemClock.uptimeMillis() + COMMAND_MONITOR_TICK_MS
+        )
     }
 
     private fun monitorCommandSilence() {
@@ -137,20 +197,26 @@ class GroqVoiceInputController(
                     val amp = groqAudioService.currentAmplitude()
                     val now = SystemClock.uptimeMillis()
                     if (amp >= AMPLITUDE_VOICE_THRESHOLD) {
-                        commandSpeechStarted = true
+                        if (!commandSpeechStarted) {
+                            commandSpeechStarted = true
+                            commandFirstSpeechAt = now
+                        }
                         commandLastVoiceAt = now
                     }
                     if (commandSpeechStarted &&
                                     commandLastVoiceAt > 0L &&
                                     now - commandLastVoiceAt >= COMMAND_SILENCE_STOP_MS
                     ) {
-                        commandCaptureActive = false
+                        resetCommandCaptureState()
                         toast("Transcribing…", TOAST_SHORT_MS)
                         groqAudioService.stopRecordingAndTranscribe()
                         return@postAtTime
                     }
-                    if (commandSpeechStarted && now - commandLastVoiceAt >= COMMAND_MAX_AFTER_SPEECH_MS) {
-                        commandCaptureActive = false
+                    if (commandSpeechStarted &&
+                                    commandFirstSpeechAt > 0L &&
+                                    now - commandFirstSpeechAt >= COMMAND_MAX_AFTER_SPEECH_MS
+                    ) {
+                        resetCommandCaptureState()
                         toast("Transcribing…", TOAST_SHORT_MS)
                         groqAudioService.stopRecordingAndTranscribe()
                         return@postAtTime
@@ -166,10 +232,12 @@ class GroqVoiceInputController(
         groqAudioService.setListener(
                 object : GroqAudioService.TranscriptionListener {
                     override fun onTranscriptionResult(text: String) {
+                        val wasCommandMode = commandCaptureActive || pendingArmWakeRouting
+                        resetManualCaptureState()
+                        resetCommandCaptureState()
                         val normalized = normalizeVoiceText(text)
                         val wakeDetected =
                                 normalized.contains("hey aiz") || normalized.startsWith("aiz")
-                        val wasCommandMode = commandCaptureActive || pendingArmWakeRouting
 
                         if (wakeLoopEnabled && !commandCaptureActive && wakeDetected) {
                             wakeChunkInFlight = false
@@ -188,7 +256,8 @@ class GroqVoiceInputController(
 
                     override fun onError(message: String) {
                         wakeChunkInFlight = false
-                        commandCaptureActive = false
+                        resetManualCaptureState()
+                        resetCommandCaptureState()
                         onRecordingUiActive(false)
                         toast(message)
                         if (wakeLoopEnabled) {
@@ -205,13 +274,15 @@ class GroqVoiceInputController(
                                         !lastListenOptions.suppressRecordingHintToast
                         ) {
                             toast(
-                                    "Listening… Tap Voice or double-tap surface again when you're done.",
+                                    "Listening. Stop speaking for 1-2 seconds.",
                                     TOAST_LISTENING_MS
                             )
                         }
                     }
 
                     override fun onRecordingStop() {
+                        resetManualCaptureState()
+                        resetCommandCaptureState()
                         onRecordingUiActive(false)
                     }
 
@@ -227,6 +298,23 @@ class GroqVoiceInputController(
     override fun release() {
         stopForegroundWakeListening()
         onRecordingUiActive(false)
+    }
+
+    private fun resetManualCaptureState() {
+        manualCaptureActive = false
+        manualSpeechStarted = false
+        manualLastVoiceAt = 0L
+        manualFirstSpeechAt = 0L
+        manualCaptureStartedAt = 0L
+        uiHandler.removeCallbacksAndMessages(MANUAL_TOKEN)
+    }
+
+    private fun resetCommandCaptureState() {
+        commandCaptureActive = false
+        commandSpeechStarted = false
+        commandLastVoiceAt = 0L
+        commandFirstSpeechAt = 0L
+        uiHandler.removeCallbacksAndMessages(WAKE_TOKEN)
     }
 
     private fun toast(message: String, durationMs: Long = TOAST_DEFAULT_MS) {
@@ -245,9 +333,14 @@ class GroqVoiceInputController(
 
     companion object {
         private val WAKE_TOKEN = Any()
+        private val MANUAL_TOKEN = Any()
         private const val WAKE_CHUNK_MS = 1800L
         private const val WAKE_CHUNK_COOLDOWN_MS = 250L
         private const val COMMAND_MONITOR_TICK_MS = 180L
+        private const val MANUAL_NO_SPEECH_STOP_MS = 4000L
+        private const val MANUAL_SILENCE_STOP_MS = 1500L
+        private const val MANUAL_MAX_AFTER_SPEECH_MS = 10000L
+        private const val MANUAL_AMPLITUDE_VOICE_THRESHOLD = 650
         private const val COMMAND_SILENCE_STOP_MS = 1500L
         private const val COMMAND_MAX_AFTER_SPEECH_MS = 8000L
         private const val AMPLITUDE_VOICE_THRESHOLD = 1200

@@ -160,11 +160,14 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                                                 "Never invent agent names. Never copy a name from transcript unless it matches one item in agents[].name. " +
                                                 "message MUST be only the user question/content for chat, with routing/wake prefixes removed. " +
                                                 "Keep message in the SAME language as the user transcript; do not translate. " +
+                                                "Example: transcript='Mở chat và hỏi Jack thời tiết hôm nay' => " +
+                                                "message='thời tiết hôm nay' (Vietnamese, not English). " +
                                                 "Remove leading patterns such as: 'open chat', 'go to chat', 'open conversation', 'hey aiz'. " +
                                                 "When an agent is mentioned in a command style, also remove the command wrapper. " +
                                                 "Example: transcript='Open chat and ask Jack that what\\'s the weather today?' => " +
                                                 "if and only if 'Jack' exists in agents[].name then agent_name='Jack'; otherwise agent_name=null. " +
                                                 "message='What\\'s the weather today?'. " +
+												"When users reference a domain (e.g. finance, hr, legal, marketing), choose agent_name only if one provided agent clearly matches by name or description; otherwise return null. " +
                                                 "If no substantive question remains, set message to empty string."
                                 )
                             }
@@ -201,7 +204,7 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
 
     companion object {
         private const val CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
-        private const val MODEL_STRICT_SMALL = "openai/gpt-oss-20b"
+        private const val MODEL_STRICT_SMALL = "openai/gpt-oss-120b"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val ROUTING_PREFIX_PATTERN =
                 Regex(
