@@ -1,5 +1,9 @@
 package com.TapLinkX3.app
 
+import com.TapLinkX3.app.routing.model.RouteTarget
+import com.TapLinkX3.app.routing.model.RoutingAction
+import com.TapLinkX3.app.routing.model.RoutingContext
+import com.TapLinkX3.app.routing.model.RoutingDecision
 import android.os.Handler
 import android.os.Looper
 import java.util.concurrent.TimeUnit
@@ -11,10 +15,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Agent row scraped from the chat page for structured intent extraction. */
-data class ChatAgent(val name: String, val description: String)
-
-/** Result of Groq chat-completions structured output for voice → chat. */
-data class ChatIntent(val agentName: String?, val message: String)
+data class ChatAgent(val id: String?, val name: String, val description: String)
 
 /**
  * Groq chat completions with [Structured Outputs](https://console.groq.com/docs/structured-outputs)
@@ -30,26 +31,22 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                     .writeTimeout(60, TimeUnit.SECONDS)
                     .build()
 
-    /**
-     * @param groqRequestFailed true when the HTTP request failed, non-2xx, or response could not
-     *     be parsed — caller may show a toast; false when a normal model JSON object was returned.
-     */
-    fun extractChatIntent(
-            transcript: String,
-            agents: List<ChatAgent>,
-            callback: (ChatIntent, groqRequestFailed: Boolean) -> Unit
+    fun extractRoutingDecision(
+            context: RoutingContext,
+            callback: (RoutingDecision, groqRequestFailed: Boolean) -> Unit
     ) {
+        DebugLog.i(
+                TAG,
+                "extractRoutingDecision transcript=\"${context.transcript.trim()}\" agents=${context.agents.size} dashboards=${context.dashboards.size} inConversation=${context.isInConversation}"
+        )
         val apiKey = groqAudioService.getApiKey()
         if (apiKey.isNullOrBlank()) {
-            mainHandler.post {
-                callback(ChatIntent(agentName = null, message = transcript), true)
-            }
+            mainHandler.post { callback(defaultRoutingDecision(context.transcript), true) }
             return
         }
-
         Thread {
             try {
-                val bodyJson = buildRequestJson(transcript, agents)
+                val bodyJson = buildRoutingRequestJson(context)
                 val request =
                         Request.Builder()
                                 .url(CHAT_COMPLETIONS_URL)
@@ -57,13 +54,10 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                                 .addHeader("Content-Type", "application/json")
                                 .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
                                 .build()
-
                 client.newCall(request).execute().use { response ->
                     val responseBody = response.body?.string().orEmpty()
                     if (!response.isSuccessful) {
-                        mainHandler.post {
-                            callback(ChatIntent(agentName = null, message = transcript), true)
-                        }
+                        mainHandler.post { callback(defaultRoutingDecision(context.transcript), true) }
                         return@use
                     }
                     val root = JSONObject(responseBody)
@@ -74,112 +68,126 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                                     ?.optString("content")
                                     .orEmpty()
                     if (content.isBlank()) {
-                        mainHandler.post {
-                            callback(ChatIntent(agentName = null, message = transcript), true)
-                        }
+                        mainHandler.post { callback(defaultRoutingDecision(context.transcript), true) }
                         return@use
                     }
-                    val parsed = parseContent(content)
-                    val ok = parsed != null
+                    val parsed = parseRoutingContent(content)
                     mainHandler.post {
-                        if (ok) {
-                            callback(parsed!!, false)
-                        } else {
-                            callback(ChatIntent(agentName = null, message = transcript), true)
-                        }
+                        if (parsed != null) callback(parsed, false)
+                        else callback(defaultRoutingDecision(context.transcript), true)
                     }
                 }
-            } catch (_: Exception) {
-                mainHandler.post {
-                    callback(ChatIntent(agentName = null, message = transcript), true)
-                }
+            } catch (e: Exception) {
+                DebugLog.e(TAG, "extractRoutingDecision exception", e)
+                mainHandler.post { callback(defaultRoutingDecision(context.transcript), true) }
             }
         }.start()
     }
 
-    private fun buildRequestJson(transcript: String, agents: List<ChatAgent>): JSONObject {
+    private fun buildRoutingRequestJson(context: RoutingContext): JSONObject {
         val agentsArr = JSONArray()
-        for (a in agents) {
+        for (a in context.agents) {
             agentsArr.put(
                     JSONObject().apply {
-                        put("name", a.name)
-                        put("description", a.description)
+                        put("id", a["id"])
+                        put("name", a["name"])
+                        put("description", a["description"])
                     }
             )
         }
-        val userPayload =
+        val dashboardsArr = JSONArray()
+        for (d in context.dashboards) {
+            dashboardsArr.put(
+                    JSONObject().apply {
+                        put("dashboard_id", d.dashboardId)
+                        put("library_id", d.libraryId)
+                        put("title", d.title)
+                    }
+            )
+        }
+        val payload =
                 JSONObject().apply {
-                    put("transcript", transcript)
-                    put("pre_stripped_message", stripRoutingPrefixForHint(transcript))
+                    put("transcript", context.transcript)
+                    put("normalized_transcript", context.normalizedTranscript)
+                    put("locale", context.locale)
+                    put("current_url", context.currentUrl)
+                    put("is_in_conversation", context.isInConversation)
+                    put("current_conversation_id", context.currentConversationId)
                     put("agents", agentsArr)
+                    put("dashboards", dashboardsArr)
                 }
-
         val schema =
                 JSONObject().apply {
                     put("type", "object")
                     put(
                             "properties",
                             JSONObject().apply {
+                                put("action", JSONObject().apply { put("type", "string") })
+                                put("route_target", JSONObject().apply { put("type", "string") })
                                 put(
-                                        "agent_name",
+                                        "dashboard_id",
+                                        JSONObject().apply {
+                                            put("type", JSONArray(listOf("string", "null")))
+                                        }
+                                )
+                                put(
+                                        "agent_id",
                                         JSONObject().apply {
                                             put("type", JSONArray(listOf("string", "null")))
                                         }
                                 )
                                 put("message", JSONObject().apply { put("type", "string") })
+                                put("confidence", JSONObject().apply { put("type", "number") })
+                                put("reason_code", JSONObject().apply { put("type", "string") })
                             }
                     )
-                    put("required", JSONArray(listOf("agent_name", "message")))
+                    put(
+                            "required",
+                            JSONArray(
+                                    listOf(
+                                            "action",
+                                            "route_target",
+                                            "dashboard_id",
+                                            "agent_id",
+                                            "message",
+                                            "confidence",
+                                            "reason_code"
+                                    )
+                            )
+                    )
                     put("additionalProperties", false)
                 }
-
         val responseFormat =
                 JSONObject().apply {
                     put("type", "json_schema")
                     put(
                             "json_schema",
                             JSONObject().apply {
-                                put("name", "chat_voice_intent")
+                                put("name", "voice_routing_decision")
                                 put("strict", true)
                                 put("schema", schema)
                             }
                     )
                 }
-
+        val system =
+                "You are a voice routing policy engine. Return JSON only. " +
+                        "Choose action from: NAVIGATE_DASHBOARD_LIST, NAVIGATE_DASHBOARD_DETAIL, NAVIGATE_AGENT_LIST, NAVIGATE_AGENT_DETAIL, NAVIGATE_CONVERSATION_NEW, CHAT_IN_CURRENT_CONVERSATION, CHAT_WITH_AGENT_SWITCH, DICTATE_TEXT, NO_OP. " +
+                        "Use dashboard_id only from dashboards[].dashboard_id. Use agent_id only from agents[].id. Never invent ids. " +
+                        "For dashboard detail use dashboard_id when user asks open/detail a specific dashboard. " +
+                        "For agent detail use agent_id when user asks open/detail a specific agent. " +
+                        "When in conversation: continue same thread => CHAT_IN_CURRENT_CONVERSATION; if user wants another agent => CHAT_WITH_AGENT_SWITCH. " +
+                        "If ambiguous or insufficient confidence return NO_OP with empty ids. " +
+                        "Keep message in original language and strip routing wrappers."
         val messages =
                 JSONArray().apply {
-                    put(
-                            JSONObject().apply {
-                                put("role", "system")
-                                put(
-                                        "content",
-                                        "You extract chat intent from voice text. " +
-                                                "Input JSON contains transcript, pre_stripped_message, and agents (name + description). " +
-                                                "Return JSON that matches the schema exactly. " +
-                                                "agent_name MUST be selected ONLY from agents[].name in the provided list, or null if no clear match. " +
-                                                "Never invent agent names. Never copy a name from transcript unless it matches one item in agents[].name. " +
-                                                "message MUST be only the user question/content for chat, with routing/wake prefixes removed. " +
-                                                "Keep message in the SAME language as the user transcript; do not translate. " +
-                                                "Example: transcript='Mở chat và hỏi Jack thời tiết hôm nay' => " +
-                                                "message='thời tiết hôm nay' (Vietnamese, not English). " +
-                                                "Remove leading patterns such as: 'open chat', 'go to chat', 'open conversation', 'hey aiz'. " +
-                                                "When an agent is mentioned in a command style, also remove the command wrapper. " +
-                                                "Example: transcript='Open chat and ask Jack that what\\'s the weather today?' => " +
-                                                "if and only if 'Jack' exists in agents[].name then agent_name='Jack'; otherwise agent_name=null. " +
-                                                "message='What\\'s the weather today?'. " +
-												"When users reference a domain (e.g. finance, hr, legal, marketing), choose agent_name only if one provided agent clearly matches by name or description; otherwise return null. " +
-                                                "If no substantive question remains, set message to empty string."
-                                )
-                            }
-                    )
+                    put(JSONObject().apply { put("role", "system"); put("content", system) })
                     put(
                             JSONObject().apply {
                                 put("role", "user")
-                                put("content", userPayload.toString())
+                                put("content", payload.toString())
                             }
                     )
                 }
-
         return JSONObject().apply {
             put("model", MODEL_STRICT_SMALL)
             put("temperature", 0)
@@ -188,31 +196,50 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
         }
     }
 
-    /** Returns null if the response body is not valid JSON for the expected shape. */
-    private fun parseContent(content: String): ChatIntent? {
+    private fun parseRoutingContent(content: String): RoutingDecision? {
         return try {
             val o = JSONObject(content)
-            val agentName: String? =
-                    if (o.isNull("agent_name")) null
-                    else o.optString("agent_name", "").trim().takeIf { it.isNotBlank() }
-            val message = o.optString("message", "")
-            ChatIntent(agentName = agentName, message = message)
+            val action =
+                    runCatching { RoutingAction.valueOf(o.optString("action", "NO_OP").trim()) }
+                            .getOrDefault(RoutingAction.NO_OP)
+            val target =
+                    runCatching { RouteTarget.valueOf(o.optString("route_target", "NONE").trim()) }
+                            .getOrDefault(RouteTarget.NONE)
+            val dashboardId =
+                    if (o.isNull("dashboard_id")) null
+                    else o.optString("dashboard_id", "").trim().takeIf { it.isNotBlank() }
+            val agentId =
+                    if (o.isNull("agent_id")) null
+                    else o.optString("agent_id", "").trim().takeIf { it.isNotBlank() }
+            RoutingDecision(
+                    action = action,
+                    routeTarget = target,
+                    dashboardId = dashboardId,
+                    agentId = agentId,
+                    message = o.optString("message", ""),
+                    confidence = o.optDouble("confidence", 0.0),
+                    reasonCode = o.optString("reason_code", "model_output")
+            )
         } catch (_: Exception) {
             null
         }
     }
 
+    private fun defaultRoutingDecision(transcript: String): RoutingDecision =
+            RoutingDecision(
+                    action = RoutingAction.NO_OP,
+                    routeTarget = RouteTarget.NONE,
+                    dashboardId = null,
+                    agentId = null,
+                    message = transcript.trim(),
+                    confidence = 0.0,
+                    reasonCode = "fallback"
+            )
+
     companion object {
+        private const val TAG = "GroqChatService"
         private const val CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
         private const val MODEL_STRICT_SMALL = "openai/gpt-oss-120b"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-        private val ROUTING_PREFIX_PATTERN =
-                Regex(
-                        """(?i)^\s*((hey\s+)?aiz\s*)?(open|go\s*to|change\s*to|show|mở|mo|chuyển\s*sang|chuyen\s*sang|đi\s*đến|di\s*den)?\s*(conversation|conversations|chat|hội\s*thoại|hoi\s*thoai|cuộc\s*trò\s*chuyện|cuoc\s*tro\s*chuyen)\s*(and\s+)?[:,-]?\s*"""
-                )
-    }
-
-    private fun stripRoutingPrefixForHint(rawText: String): String {
-        return rawText.replace(ROUTING_PREFIX_PATTERN, "").trim()
     }
 }

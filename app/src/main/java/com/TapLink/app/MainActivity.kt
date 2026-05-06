@@ -75,6 +75,13 @@ import com.journeyapps.barcodescanner.DefaultDecoderFactory
 import com.journeyapps.barcodescanner.camera.CameraConfigurationUtils
 import com.ffalconxr.mercury.ipc.Launcher
 import com.ffalconxr.mercury.ipc.helpers.GPSIPCHelper
+import com.TapLinkX3.app.routing.execution.RoutingUrlBuilder
+import com.TapLinkX3.app.routing.model.DashboardCandidate
+import com.TapLinkX3.app.routing.model.RouteTarget
+import com.TapLinkX3.app.routing.model.RoutingAction
+import com.TapLinkX3.app.routing.model.RoutingContext
+import com.TapLinkX3.app.routing.model.RoutingDecision
+import com.TapLinkX3.app.routing.validation.RoutingDecisionValidator
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
@@ -397,37 +404,12 @@ class MainActivity :
             val timeoutRunnable: Runnable,
             var acked: Boolean = false
     )
-    private data class VoiceRoutingContext(
-            val isDetailWithoutSelector: Boolean,
-            val currentConversationAgentName: String?,
-            val targetAgentName: String?
-    ) {
-        val shouldNavigateForAgentSwitch: Boolean
-            get() {
-                if (!isDetailWithoutSelector) return false
-                val current = currentConversationAgentName?.trim().orEmpty()
-                val target = targetAgentName?.trim().orEmpty()
-                if (current.isEmpty() || target.isEmpty()) return false
-                return !current.equals(target, ignoreCase = true)
-            }
-    }
     private var cachedChatAgents: List<ChatAgent> = emptyList()
     private var lastKnownChatAgents: List<ChatAgent> = emptyList()
     private var cachedChatAgentsAt: Long = 0L
-    private val vietnameseDiacriticRegex =
-            Regex("[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]")
-    private val vietnameseHintTokens =
-            listOf(
-                    " toi ",
-                    " bạn ",
-                    " ban ",
-                    " giúp ",
-                    " giup ",
-                    " thời tiết",
-                    " thoi tiet",
-                    " hôm nay",
-                    " hom nay"
-            )
+    private var cachedDashboards: List<DashboardCandidate> = emptyList()
+    private var lastKnownDashboards: List<DashboardCandidate> = emptyList()
+    private var cachedDashboardsAt: Long = 0L
     // Bumps for each voice->chat command so stale async callbacks cannot send older text later.
     private var chatVoicePipelineGeneration: Long = 0L
     /** After full [WebView.loadUrl] to the conversation route, run voice follow-up (SPA uses in-callback). */
@@ -2382,6 +2364,7 @@ class MainActivity :
     private val dashboardRouteUrl = "https://agentz-demo.aizcorp.vn/cognition/dashboards"
     private val conversationRouteUrl = "https://agentz-demo.aizcorp.vn/assistant/conversations"
     private val agentsRouteUrl = "https://agentz-demo.aizcorp.vn/assistant/agents"
+    private val appOriginUrl = "https://agentz-demo.aizcorp.vn"
     private val voiceOrchestratorSchemaVersion = "1.0"
     private val voiceOrchestratorAckTimeoutMs = 1500L
     private val wakeWordPattern = Regex("""(?i)\bhey\s*aiz\b""")
@@ -2748,8 +2731,7 @@ class MainActivity :
         DebugLog.d("VoiceTranscript", "STT raw transcript: \"$trimmed\"")
         val normalized = normalizeVoiceText(trimmed)
         val afterWake = stripWakeCommandPrefix(normalized)
-        val wakeWordOnly =
-                utteranceHasWakePrefix(normalized) && !containsRouteKeyword(afterWake)
+        val wakeWordOnly = utteranceHasWakePrefix(normalized) && afterWake.isBlank()
         if (wakeWordOnly) {
             dualWebViewGroup.showToast("AIZ heard — say your command")
             voiceInputController.startListening(
@@ -2761,87 +2743,32 @@ class MainActivity :
             )
             return
         }
-
-        val route = resolveRouteFromCommand(normalized)
-        val alreadyOnChat =
-                webView.url.orEmpty().startsWith(conversationRouteUrl, ignoreCase = true)
-
-        if (route == dashboardRouteUrl) {
-            navigateRouteWithoutReload(routeUrl = dashboardRouteUrl)
-            wakeWordArmed = false
-            return
-        }
-        if (route == agentsRouteUrl) {
-            val handledByWeb =
-                    dispatchVoiceActionToWebOrchestrator(trimmed, normalized) {
-                        navigateRouteWithoutReload(routeUrl = agentsRouteUrl)
-                    }
-            if (!handledByWeb) {
-                navigateRouteWithoutReload(routeUrl = agentsRouteUrl)
-            }
-            wakeWordArmed = false
-            return
-        }
-
-        val chatVoiceIntent =
-                route == conversationRouteUrl ||
-                        (alreadyOnChat && route != dashboardRouteUrl)
-        if (chatVoiceIntent) {
-            val handledByWeb =
-                    dispatchVoiceActionToWebOrchestrator(trimmed, normalized) {
-                        runNativeConversationVoicePipeline(trimmed, route, alreadyOnChat)
-                    }
-            if (handledByWeb) {
-                wakeWordArmed = false
-                return
-            }
-            runNativeConversationVoicePipeline(trimmed, route, alreadyOnChat)
-            wakeWordArmed = false
-            return
-        }
-        if (wakeWordArmed) {
-            val handledByWeb =
-                    dispatchVoiceActionToWebOrchestrator(trimmed, normalized) { /* no-op */ }
-            if (handledByWeb) {
-                wakeWordArmed = false
-                return
-            }
-        }
-        if (wakeWordArmed) {
-            dualWebViewGroup.showToast(
-                    "Say where to go: dashboard, chat, agents, or speak without wake for dictation.",
-                    3200L
-            )
-            wakeWordArmed = false
-            return
-        }
-
-        onShowKeyboardForEdit(text)
-        val editFieldVisible = dualWebViewGroup.urlEditText.visibility == View.VISIBLE
-
-        when {
-            dualWebViewGroup.isBookmarksExpanded() && !editFieldVisible -> {
-                // Handle bookmark menu navigation - maybe search bookmarks?
-                // For now just ignore
-            }
-            editFieldVisible -> {
-                // Handle URL/bookmark edit field input
-                val currentText = dualWebViewGroup.getCurrentLinkText()
-                val cursorPosition = dualWebViewGroup.urlEditText.selectionStart.coerceAtLeast(0)
-                val newText = StringBuilder(currentText).insert(cursorPosition, text).toString()
-                dualWebViewGroup.setLinkText(newText, cursorPosition + text.length)
-            }
-            dualWebViewGroup.getDialogInput() != null -> {
-                val input = dualWebViewGroup.getDialogInput() ?: return
-                val currentText = input.text.toString()
-                val cursorPosition = input.selectionStart.coerceAtLeast(0)
-                val newText = StringBuilder(currentText).insert(cursorPosition, text).toString()
-                input.setText(newText)
-                input.setSelection((cursorPosition + text.length).coerceAtMost(newText.length))
-            }
-            else -> {
-                sendTextToWebView(text)
-            }
+        val agentCandidates = if (cachedChatAgents.isNotEmpty()) cachedChatAgents else lastKnownChatAgents
+        val dashboardCandidates =
+                if (cachedDashboards.isNotEmpty()) cachedDashboards else lastKnownDashboards
+        val routingContext =
+                RoutingContext(
+                        transcript = trimmed,
+                        normalizedTranscript = normalized,
+                        locale = Locale.getDefault().toLanguageTag(),
+                        currentUrl = webView.url.orEmpty(),
+                        isInConversation =
+                                webView.url
+                                        .orEmpty()
+                                        .startsWith(conversationRouteUrl, ignoreCase = true),
+                        currentConversationId = extractConversationIdFromUrl(webView.url),
+                        agents =
+                                agentCandidates.map {
+                                    mapOf(
+                                            "id" to it.id,
+                                            "name" to it.name,
+                                            "description" to it.description
+                                    )
+                                },
+                        dashboards = dashboardCandidates
+                )
+        groqChatService.extractRoutingDecision(routingContext) { decision, failed ->
+            executeRoutingDecision(trimmed, normalized, decision, failed)
         }
     }
 
@@ -2872,6 +2799,126 @@ class MainActivity :
             }
     }
 
+    private fun executeRoutingDecision(
+            transcript: String,
+            normalized: String,
+            rawDecision: RoutingDecision,
+            modelFailed: Boolean
+    ) {
+        val agents = if (cachedChatAgents.isNotEmpty()) cachedChatAgents else lastKnownChatAgents
+        val dashboards = if (cachedDashboards.isNotEmpty()) cachedDashboards else lastKnownDashboards
+        val validation = RoutingDecisionValidator.validate(rawDecision, agents, dashboards)
+        val decision = validation.sanitized
+        DebugLog.i(
+                "VoiceRouting",
+                "decision action=${rawDecision.action} validated=${validation.accepted} error=${validation.error} routeTarget=${decision.routeTarget} dashboardId=${decision.dashboardId} agentId=${decision.agentId} confidence=${decision.confidence} reason=${decision.reasonCode} failed=$modelFailed"
+        )
+        if (!validation.accepted || decision.action == RoutingAction.NO_OP) {
+            dualWebViewGroup.showToast("Cannot match action", 1600L)
+            wakeWordArmed = false
+            return
+        }
+        when (decision.action) {
+            RoutingAction.NAVIGATE_DASHBOARD_LIST -> {
+                navigateRouteWithoutReload(
+                        RoutingUrlBuilder.buildDashboardListUrl(appOriginUrl)
+                )
+            }
+            RoutingAction.NAVIGATE_DASHBOARD_DETAIL -> {
+                val item = findDashboardById(dashboards, decision.dashboardId)
+                val target =
+                        item?.let {
+                            RoutingUrlBuilder.buildDashboardDetailUrl(
+                                    appOriginUrl,
+                                    it.libraryId,
+                                    it.dashboardId
+                            )
+                        }
+                if (target == null) {
+                    dualWebViewGroup.showToast("Dashboard not found", 1800L)
+                    wakeWordArmed = false
+                    return
+                }
+                navigateRouteWithoutReload(target)
+            }
+            RoutingAction.NAVIGATE_AGENT_LIST -> {
+                navigateRouteWithoutReload(RoutingUrlBuilder.buildAgentListUrl(appOriginUrl))
+            }
+            RoutingAction.NAVIGATE_AGENT_DETAIL -> {
+                val target = RoutingUrlBuilder.buildAgentDetailUrl(appOriginUrl, decision.agentId.orEmpty())
+                if (target == null) {
+                    dualWebViewGroup.showToast("Agent not found", 1800L)
+                    wakeWordArmed = false
+                    return
+                }
+                navigateRouteWithoutReload(target)
+            }
+            RoutingAction.NAVIGATE_CONVERSATION_NEW -> {
+                navigateRouteWithoutReload(conversationRouteUrl)
+            }
+            RoutingAction.CHAT_IN_CURRENT_CONVERSATION -> {
+                val alreadyOnChat =
+                        webView.url.orEmpty().startsWith(conversationRouteUrl, ignoreCase = true)
+                runNativeConversationVoicePipeline(
+                        transcript,
+                        if (alreadyOnChat) null else conversationRouteUrl,
+                        alreadyOnChat
+                )
+            }
+            RoutingAction.CHAT_WITH_AGENT_SWITCH -> {
+                val alreadyOnChat =
+                        webView.url.orEmpty().startsWith(conversationRouteUrl, ignoreCase = true)
+                runNativeConversationVoicePipeline(
+                        transcript,
+                        if (alreadyOnChat) null else conversationRouteUrl,
+                        alreadyOnChat
+                )
+            }
+            RoutingAction.DICTATE_TEXT -> {
+                applyDictationFallback(transcript)
+            }
+            RoutingAction.NO_OP -> {
+                dualWebViewGroup.showToast("Cannot match action", 1600L)
+            }
+        }
+        val handledByWeb = dispatchVoiceActionToWebOrchestrator(transcript, normalized) {}
+        if (handledByWeb) {
+            DebugLog.d("VoiceRouting", "Web orchestrator received decision action=${decision.action}")
+        }
+        wakeWordArmed = false
+    }
+
+    private fun applyDictationFallback(text: String) {
+        onShowKeyboardForEdit(text)
+        val editFieldVisible = dualWebViewGroup.urlEditText.visibility == View.VISIBLE
+        when {
+            dualWebViewGroup.isBookmarksExpanded() && !editFieldVisible -> {}
+            editFieldVisible -> {
+                val currentText = dualWebViewGroup.getCurrentLinkText()
+                val cursorPosition = dualWebViewGroup.urlEditText.selectionStart.coerceAtLeast(0)
+                val newText = StringBuilder(currentText).insert(cursorPosition, text).toString()
+                dualWebViewGroup.setLinkText(newText, cursorPosition + text.length)
+            }
+            dualWebViewGroup.getDialogInput() != null -> {
+                val input = dualWebViewGroup.getDialogInput() ?: return
+                val currentText = input.text.toString()
+                val cursorPosition = input.selectionStart.coerceAtLeast(0)
+                val newText = StringBuilder(currentText).insert(cursorPosition, text).toString()
+                input.setText(newText)
+                input.setSelection((cursorPosition + text.length).coerceAtMost(newText.length))
+            }
+            else -> sendTextToWebView(text)
+        }
+    }
+
+    private fun findDashboardById(
+            candidates: List<DashboardCandidate>,
+            dashboardId: String?
+    ): DashboardCandidate? {
+        if (dashboardId.isNullOrBlank()) return null
+        return candidates.firstOrNull { it.dashboardId.equals(dashboardId.trim(), ignoreCase = true) }
+    }
+
     private fun normalizeVoiceText(text: String): String {
         val lower = text.lowercase().trim()
         val decomposed = Normalizer.normalize(lower, Normalizer.Form.NFD)
@@ -2880,30 +2927,6 @@ class MainActivity :
                 .replace(Regex("[^\\p{L}\\p{N}\\s]"), " ") // strip non-letter/digit/space
                 .replace(Regex("\\s+"), " ")
                 .trim()
-    }
-
-    private fun containsRouteKeyword(normalized: String): Boolean {
-        val dashboardKeywords = listOf("dashboard", "bang dieu khien")
-        val conversationKeywords =
-                listOf("conversation", "conversations", "chat", "hoi thoai", "cuoc tro chuyen")
-        val agentsKeywords = listOf("agent", "agents", "tro ly", "assistant")
-        return dashboardKeywords.any { normalized.contains(it) } ||
-                conversationKeywords.any { normalized.contains(it) } ||
-                agentsKeywords.any { normalized.contains(it) }
-    }
-
-    private fun resolveRouteFromCommand(normalized: String): String? {
-        if (normalized.isBlank()) return null
-        val command = stripWakeCommandPrefix(normalized)
-        if (command.isBlank()) return null
-        val dashboardKeywords = listOf("dashboard", "bang dieu khien")
-        if (dashboardKeywords.any { command.contains(it) }) return dashboardRouteUrl
-        val conversationKeywords =
-                listOf("conversation", "conversations", "chat", "hoi thoai", "cuoc tro chuyen")
-        if (conversationKeywords.any { command.contains(it) }) return conversationRouteUrl
-        val agentsKeywords = listOf("agent", "agents", "tro ly", "assistant")
-        if (agentsKeywords.any { command.contains(it) }) return agentsRouteUrl
-        return null
     }
 
     private fun dispatchVoiceActionToWebOrchestrator(
@@ -3051,9 +3074,16 @@ class MainActivity :
                 val out = ArrayList<ChatAgent>()
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
+                    val id = o.optString("id", "").trim().takeIf { it.isNotEmpty() }
                     val name = o.optString("name", "").trim()
                     if (name.isNotEmpty()) {
-                        out.add(ChatAgent(name, o.optString("description", "").trim()))
+                        out.add(
+                                ChatAgent(
+                                        id = id,
+                                        name = name,
+                                        description = o.optString("description", "").trim()
+                                )
+                        )
                     }
                 }
                 cachedChatAgents = out
@@ -3063,6 +3093,38 @@ class MainActivity :
                 cachedChatAgentsAt = SystemClock.elapsedRealtime()
             } catch (e: Exception) {
                 DebugLog.e("ChatAgents", "cacheChatAgentsFromJs", e)
+            }
+        }
+    }
+
+    fun cacheDashboardsFromJs(json: String) {
+        runOnUiThread {
+            try {
+                val arr = JSONArray(json)
+                val out = ArrayList<DashboardCandidate>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val dashboardId = o.optString("dashboard_id", "").trim()
+                    val libraryId = o.optString("library_id", "").trim()
+                    val title = o.optString("title", "").trim()
+                    if (dashboardId.isNotEmpty() && libraryId.isNotEmpty()) {
+                        out.add(
+                                DashboardCandidate(
+                                        dashboardId = dashboardId,
+                                        libraryId = libraryId,
+                                        title = title
+                                )
+                        )
+                    }
+                }
+                cachedDashboards = out
+                if (out.isNotEmpty()) {
+                    lastKnownDashboards = out
+                }
+                cachedDashboardsAt = SystemClock.elapsedRealtime()
+                DebugLog.i("Dashboards", "cacheDashboardsFromJs size=${out.size}")
+            } catch (e: Exception) {
+                DebugLog.e("Dashboards", "cacheDashboardsFromJs", e)
             }
         }
     }
@@ -3081,6 +3143,7 @@ class MainActivity :
               function scrape(){
                 return Array.from(document.querySelectorAll('.chat-agent-option'))
                   .map(function(el) {
+                    var id = (el.getAttribute('data-agent-id') || '').trim();
                     var nameEl = el.querySelector('[data-agent-name], .agent-name');
                     var name = (nameEl && nameEl.innerText ? nameEl.innerText : '')
                       || (el.innerText ? el.innerText.split('\n')[0] : '') || '';
@@ -3090,7 +3153,7 @@ class MainActivity :
                       var parts = el.innerText.split('\n');
                       desc = parts.slice(1).join(' ').trim();
                     }
-                    return { name: name, description: desc };
+                    return { id: id || null, name: name, description: desc };
                   })
                   .filter(function(a) { return a.name; });
               }
@@ -3109,6 +3172,44 @@ class MainActivity :
                 }
                 try { document.body.click(); } catch (e) {}
               }, 250);
+            })();
+        """.trimIndent()
+        target.evaluateJavascript(js, null)
+    }
+
+    private fun injectDashboardScraper(target: WebView?) {
+        if (target == null) return
+        val js =
+                """
+            (function(){
+              function fromHref(href){
+                if (!href) return null;
+                var m = href.match(/\/cognition\/libraries\/([^\/?#]+)\/dashboards\/([^\/?#]+)/i);
+                if (!m) return null;
+                return { library_id: decodeURIComponent(m[1]), dashboard_id: decodeURIComponent(m[2]) };
+              }
+              var candidates = [];
+              var links = Array.from(document.querySelectorAll('a[href*="/cognition/libraries/"][href*="/dashboards/"]'));
+              links.forEach(function(a){
+                var parsed = fromHref(a.getAttribute('href') || a.href || '');
+                if (!parsed) return;
+                var title = (a.innerText || a.getAttribute('title') || '').trim();
+                candidates.push({
+                  dashboard_id: parsed.dashboard_id,
+                  library_id: parsed.library_id,
+                  title: title
+                });
+              });
+              var seen = {};
+              var uniq = candidates.filter(function(x){
+                var k = x.library_id + '::' + x.dashboard_id;
+                if (seen[k]) return false;
+                seen[k] = true;
+                return true;
+              });
+              if (window.AndroidInterface && window.AndroidInterface.cacheDashboards) {
+                window.AndroidInterface.cacheDashboards(JSON.stringify(uniq));
+              }
             })();
         """.trimIndent()
         target.evaluateJavascript(js, null)
@@ -4808,6 +4909,9 @@ class MainActivity :
                                         webView.postDelayed(cb, 400L)
                                     }
                                 }
+                                if (url.startsWith(dashboardRouteUrl, ignoreCase = true)) {
+                                    injectDashboardScraper(view)
+                                }
 
                                 // Re-apply saved font settings to new page
                                 dualWebViewGroup.reapplyWebFontSettings()
@@ -5409,16 +5513,10 @@ class MainActivity :
         }
     }
 
-    private fun matchCachedAgentName(fromModel: String?, candidates: List<ChatAgent>): String? {
-        if (fromModel.isNullOrBlank()) return null
-        val want = normalizeVoiceText(fromModel)
-        for (ca in candidates) {
-            val n = normalizeVoiceText(ca.name)
-            if (n == want || want.contains(n) || n.contains(want)) {
-                return ca.name
-            }
-        }
-        return null
+    private fun findAgentById(candidates: List<ChatAgent>, agentId: String?): ChatAgent? {
+        if (agentId.isNullOrBlank()) return null
+        val want = agentId.trim()
+        return candidates.firstOrNull { it.id.equals(want, ignoreCase = true) }
     }
 
     private fun runConversationVoiceActions(
@@ -5442,163 +5540,42 @@ class MainActivity :
             executeChatFillAndSend(strippedMessage, generation)
             return
         }
-        groqChatService.extractChatIntent(trimmed, agentCandidates) { intent, groqFailed ->
-            if (generation != chatVoicePipelineGeneration) return@extractChatIntent
-            val firstName = agentCandidates.first().name
-            val matched = matchCachedAgentName(intent.agentName, agentCandidates)
-            val resolvedAgent = matched ?: firstName
-            val messageOut =
-                    sanitizeChatMessage(
-                                    pickMessageInUserLanguage(
-                                            transcript = trimmed,
-                                            extractedMessage = intent.message,
-                                            strippedFallback = strippedMessage
-                                    ),
-                                    strippedMessage,
-                                    resolvedAgent
-                            )
-                            .ifBlank { strippedMessage }
-            DebugLog.d(
-                    "VoiceTranscript",
-                    "Groq intent generation=$generation failed=$groqFailed agentFromModel=\"${intent.agentName}\" resolvedAgent=\"$resolvedAgent\" extracted=\"${intent.message}\" final=\"$messageOut\""
-            )
-            if (!selectorAvailable) {
-                applyDetailPolicyBRouting(
-                        generation = generation,
-                        trimmed = trimmed,
-                        strippedMessage = strippedMessage,
-                        resolvedAgent = resolvedAgent,
-                        messageOut = messageOut
+        val isInConversation =
+                webView.url.orEmpty().startsWith(conversationRouteUrl, ignoreCase = true)
+        val dashboards = if (cachedDashboards.isNotEmpty()) cachedDashboards else lastKnownDashboards
+        val context =
+                RoutingContext(
+                        transcript = trimmed,
+                        normalizedTranscript = normalizeVoiceText(trimmed),
+                        locale = Locale.getDefault().toLanguageTag(),
+                        currentUrl = webView.url.orEmpty(),
+                        isInConversation = isInConversation,
+                        currentConversationId = extractConversationIdFromUrl(webView.url),
+                        agents =
+                                agentCandidates.map {
+                                    mapOf(
+                                            "id" to it.id,
+                                            "name" to it.name,
+                                            "description" to it.description
+                                    )
+                                },
+                        dashboards = dashboards
                 )
-                return@extractChatIntent
+        groqChatService.extractRoutingDecision(context) { decision, groqFailed ->
+            if (generation != chatVoicePipelineGeneration) return@extractRoutingDecision
+            if (!selectorAvailable && decision.action == RoutingAction.CHAT_WITH_AGENT_SWITCH) {
+                executeChatFillAndSend(strippedMessage, generation)
+                return@extractRoutingDecision
             }
-            if (groqFailed) {
-                dualWebViewGroup.showToast("Could not pick agent. Using $firstName.", 2200L)
-            } else {
-                dualWebViewGroup.showToast("Sending to $resolvedAgent.", 1600L)
+            val resolvedAgent = findAgentById(agentCandidates, decision.agentId)
+            val messageOut = decision.message.trim().ifBlank { strippedMessage }
+            if (decision.action != RoutingAction.CHAT_WITH_AGENT_SWITCH || resolvedAgent == null) {
+                if (groqFailed) dualWebViewGroup.showToast("Could not route. Sending in current chat.", 2200L)
+                executeChatFillAndSend(messageOut, generation)
+                return@extractRoutingDecision
             }
             executeChatVoiceCommand(resolvedAgent, messageOut, generation)
         }
-    }
-
-    private fun applyDetailPolicyBRouting(
-            generation: Long,
-            trimmed: String,
-            strippedMessage: String,
-            resolvedAgent: String,
-            messageOut: String
-    ) {
-        if (generation != chatVoicePipelineGeneration) return
-        probeCurrentConversationAgentName(generation = generation) { currentAgent ->
-            if (generation != chatVoicePipelineGeneration) return@probeCurrentConversationAgentName
-            val ctx =
-                    VoiceRoutingContext(
-                            isDetailWithoutSelector = true,
-                            currentConversationAgentName = currentAgent,
-                            targetAgentName = resolvedAgent
-                    )
-            if (ctx.shouldNavigateForAgentSwitch) {
-                dualWebViewGroup.showToast("Switching agent...", 1400L)
-                navigateRouteWithoutReload(conversationRouteUrl) {
-                    scheduleConversationVoicePipeline(
-                            trimmed = trimmed,
-                            strippedMessage = strippedMessage,
-                            generation = generation,
-                            waitForSelectorAfterNavigation = true
-                    )
-                }
-                return@probeCurrentConversationAgentName
-            }
-            executeChatFillAndSend(messageOut, generation)
-        }
-    }
-
-    private fun probeCurrentConversationAgentName(
-            generation: Long,
-            attempt: Int = 0,
-            callback: (String?) -> Unit
-    ) {
-        if (generation != chatVoicePipelineGeneration) return
-        val target = webView
-        val js =
-                """
-            (function() {
-              var selectors = [
-                '[data-current-agent-name]',
-                '[data-testid="current-agent-name"]',
-                '.chat-current-agent-name',
-                '.conversation-agent-name',
-                '.agent-name',
-                '.chat-header [class*="agent"]',
-                '.conversation-header [class*="agent"]'
-              ];
-              for (var i = 0; i < selectors.length; i++) {
-                var el = document.querySelector(selectors[i]);
-                var txt = (el && el.textContent ? el.textContent : '').trim();
-                if (txt) return txt;
-              }
-              return '';
-            })();
-        """.trimIndent()
-        target.evaluateJavascript(js) { result ->
-            if (generation != chatVoicePipelineGeneration) return@evaluateJavascript
-            val value = result?.trim().orEmpty().trim('"').trim()
-            if (value.isNotBlank() || attempt >= 2) {
-                callback(value.ifBlank { null })
-                return@evaluateJavascript
-            }
-            target.postDelayed(
-                    {
-                        probeCurrentConversationAgentName(
-                                generation = generation,
-                                attempt = attempt + 1,
-                                callback = callback
-                        )
-                    },
-                    220L
-            )
-        }
-    }
-
-    private fun sanitizeChatMessage(message: String, fallback: String, agentName: String): String {
-        val raw = message.trim().ifBlank { fallback.trim() }
-        if (raw.isBlank()) return raw
-        var out = raw
-        out = out.replace(
-                Regex("""(?i)^\s*((hey\s+)?aiz\s*)?(open|go\s*to|show)\s*(chat|conversation)\s*(and\s+)?"""),
-                ""
-        ).trim()
-        out = out.replace(
-                Regex("""(?i)^\s*(ask|tell|message)\s+${Regex.escape(agentName)}\s*(that)?\s*[:,-]?\s*"""),
-                ""
-        ).trim()
-        return out.ifBlank { fallback.trim() }
-    }
-
-    private fun pickMessageInUserLanguage(
-            transcript: String,
-            extractedMessage: String,
-            strippedFallback: String
-    ): String {
-        val extracted = extractedMessage.trim()
-        if (extracted.isBlank()) return strippedFallback
-        val transcriptLooksVietnamese = looksVietnamese(transcript)
-        if (!transcriptLooksVietnamese) return extracted
-        // Keep user language if model unexpectedly translated to English.
-        if (looksVietnamese(extracted)) return extracted
-        return strippedFallback
-    }
-
-    private fun looksVietnamese(text: String): Boolean {
-        if (text.isBlank()) return false
-        val lower = " ${text.lowercase(Locale.US)} "
-        if (vietnameseDiacriticRegex.containsMatchIn(lower)) return true
-        var hintCount = 0
-        for (token in vietnameseHintTokens) {
-            if (lower.contains(token)) hintCount++
-            if (hintCount >= 2) return true
-        }
-        return false
     }
 
     private fun evaluateConversationChatJs(
@@ -5721,14 +5698,16 @@ class MainActivity :
         evaluateConversationChatJs(webView, js, generation)
     }
 
-    private fun executeChatVoiceCommand(agentDisplayName: String, message: String, generation: Long) {
-        val qAgent = JSONObject.quote(agentDisplayName)
+    private fun executeChatVoiceCommand(agent: ChatAgent, message: String, generation: Long) {
+        val qAgent = JSONObject.quote(agent.name)
+        val qAgentId = JSONObject.quote(agent.id ?: "")
         val qMsg = JSONObject.quote(message)
         val qToken = JSONObject.quote("voice-$generation")
         val js =
                 """
             (function(){
               var targetAgent = $qAgent;
+              var targetAgentId = $qAgentId;
               var msg = $qMsg;
               var token = $qToken;
               if (!window.__taplinkVoiceSendState) window.__taplinkVoiceSendState = {};
@@ -5747,10 +5726,18 @@ class MainActivity :
                 trig.click();
                 setTimeout(function() {
                   var opts = document.querySelectorAll('.chat-agent-option');
-                  var want = norm(targetAgent);
-                  var hit = Array.from(opts).find(function(o) {
-                    return norm(o.innerText).indexOf(want) >= 0 || want.indexOf(norm(o.innerText)) >= 0;
-                  });
+                  var hit = null;
+                  if (targetAgentId) {
+                    hit = Array.from(opts).find(function(o) {
+                      return ((o.getAttribute('data-agent-id') || '').trim() === targetAgentId);
+                    });
+                  }
+                  if (!hit) {
+                    var want = norm(targetAgent);
+                    hit = Array.from(opts).find(function(o) {
+                      return norm(o.innerText).indexOf(want) >= 0 || want.indexOf(norm(o.innerText)) >= 0;
+                    });
+                  }
                   if (hit) { hit.click(); cb(true); return; }
                   try { document.body.click(); } catch (e) {}
                   cb(false);
@@ -7568,6 +7555,11 @@ class MainActivity :
         @JavascriptInterface
         fun cacheChatAgents(json: String) {
             activity.cacheChatAgentsFromJs(json)
+        }
+
+        @JavascriptInterface
+        fun cacheDashboards(json: String) {
+            activity.cacheDashboardsFromJs(json)
         }
 
         @JavascriptInterface

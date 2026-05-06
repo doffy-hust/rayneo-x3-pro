@@ -9,6 +9,12 @@ import android.util.Log
 object DebugLog {
     private val isDebug = BuildConfig.DEBUG
 
+    fun i(tag: String, message: String) {
+        if (isDebug) {
+            Log.i(tag, message)
+        }
+    }
+
     fun d(tag: String, message: String) {
         if (isDebug) {
             Log.d(tag, message)
