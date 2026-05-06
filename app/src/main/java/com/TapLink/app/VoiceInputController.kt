@@ -339,7 +339,7 @@ class GroqVoiceInputController(
         private const val COMMAND_MONITOR_TICK_MS = 180L
         private const val MANUAL_NO_SPEECH_STOP_MS = 4000L
         private const val MANUAL_SILENCE_STOP_MS = 1500L
-        private const val MANUAL_MAX_AFTER_SPEECH_MS = 10000L
+        private const val MANUAL_MAX_AFTER_SPEECH_MS = 15000L
         private const val MANUAL_AMPLITUDE_VOICE_THRESHOLD = 650
         private const val COMMAND_SILENCE_STOP_MS = 1500L
         private const val COMMAND_MAX_AFTER_SPEECH_MS = 8000L
