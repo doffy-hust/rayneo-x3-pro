@@ -3248,6 +3248,19 @@ class MainActivity :
               function scrapeOnce(){
                 var candidates = [];
                 // Preferred: explicit IDs you added on dashboard cards.
+                var dashboardCards = Array.from(document.querySelectorAll('.dashboard-card'));
+                dashboardCards.forEach(function(el){
+                  var did = String(el.getAttribute('data-dashboard-id') || '').trim();
+                  var lid = String(el.getAttribute('data-library-id') || '').trim();
+                  if (!did || !lid) return;
+                  var title = (el.getAttribute('data-title') || el.getAttribute('title') || el.innerText || '')
+                    .trim().split('\n')[0].trim();
+                  candidates.push({
+                    dashboard_id: did,
+                    library_id: lid,
+                    title: title
+                  });
+                });
                 var cards = Array.from(document.querySelectorAll('[data-dashboard-id][data-library-id]'));
                 cards.forEach(function(el){
                   var did = String(el.getAttribute('data-dashboard-id') || '').trim();
@@ -3327,6 +3340,15 @@ class MainActivity :
               }
               function scrapeOnce(){
                 var out = [];
+                var cards = Array.from(document.querySelectorAll('.agent-card'));
+                cards.forEach(function(el){
+                  var id = String(el.getAttribute('data-agent-id') || '').trim();
+                  if (!id) return;
+                  var name = (el.getAttribute('data-agent-name') || el.getAttribute('title') || el.innerText || '')
+                    .trim().split('\n')[0].trim();
+                  if (!name) return;
+                  out.push({ id: id, name: name, description: '' });
+                });
                 var links = Array.from(document.querySelectorAll('a[href*="/assistant/agents/"]'));
                 links.forEach(function(a){
                   var id = parseAgentId(a.getAttribute('href') || a.href || '');
