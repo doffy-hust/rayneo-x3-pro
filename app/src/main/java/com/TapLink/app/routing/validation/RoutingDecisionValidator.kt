@@ -26,9 +26,7 @@ object RoutingDecisionValidator {
                 return reject(clamped, "unknown_dashboard_id")
             }
         }
-        if (clamped.action == RoutingAction.NAVIGATE_AGENT_DETAIL ||
-                        clamped.action == RoutingAction.CHAT_WITH_AGENT_SWITCH
-        ) {
+        if (clamped.action == RoutingAction.NAVIGATE_AGENT_DETAIL) {
             val id = clamped.agentId.orEmpty()
             if (id.isBlank()) return reject(clamped, "missing_agent_id")
             if (agents.none { it.id.equals(id, ignoreCase = true) }) {
