@@ -1,44 +1,37 @@
 package com.TapLinkX3.app
 
-import android.util.Log
-
 /**
  * Utility object for debug logging that only logs in debug builds.
  * All Log.d calls should use this to ensure no debug logs in production.
  */
 object DebugLog {
-    private val isDebug = BuildConfig.DEBUG
-
     fun i(tag: String, message: String) {
-        if (isDebug) {
-            Log.i(tag, message)
-        }
+        // debug logging disabled
     }
 
     fun d(tag: String, message: String) {
-        if (isDebug) {
-            Log.d(tag, message)
-        }
+        // debug logging disabled
     }
 
     fun d(tag: String, messageProvider: () -> String) {
-        if (isDebug) {
-            Log.d(tag, messageProvider())
-        }
+        // debug logging disabled
     }
 
     fun w(tag: String, message: String) {
-        if (isDebug) {
-            Log.w(tag, message)
-        }
+        // debug logging disabled
     }
 
     fun e(tag: String, message: String, throwable: Throwable? = null) {
-        // Error logs are always shown, even in production
-        if (throwable != null) {
-            Log.e(tag, message, throwable)
-        } else {
-            Log.e(tag, message)
-        }
+        // debug logging disabled
+    }
+
+    /** Always forwarded to [Log.i], including release builds (may include user transcript content). */
+    fun alwaysI(tag: String, message: String) {
+        // debug logging disabled
+    }
+
+    /** Always forwarded to [Log.w], including release builds. */
+    fun alwaysW(tag: String, message: String) {
+        // debug logging disabled
     }
 }

@@ -35,18 +35,23 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
             context: RoutingContext,
             callback: (RoutingDecision, groqRequestFailed: Boolean) -> Unit
     ) {
-        DebugLog.i(
+        DebugLog.alwaysI(
                 TAG,
                 "extractRoutingDecision transcript=\"${context.transcript.trim()}\" agents=${context.agents.size} dashboards=${context.dashboards.size} inConversation=${context.isInConversation}"
         )
         val apiKey = groqAudioService.getApiKey()
         if (apiKey.isNullOrBlank()) {
+            DebugLog.alwaysW(TAG, "extractRoutingDecision skipped: API key empty")
             mainHandler.post { callback(defaultRoutingDecision(context.transcript), true) }
             return
         }
         Thread {
             try {
                 val bodyJson = buildRoutingRequestJson(context)
+                DebugLog.alwaysI(
+                        TAG,
+                        "llm_request model=$MODEL_STRICT_SMALL transcript=\"${context.transcript.trim().take(220)}\" normalized=\"${context.normalizedTranscript.take(220)}\""
+                )
                 val request =
                         Request.Builder()
                                 .url(CHAT_COMPLETIONS_URL)
@@ -57,6 +62,9 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                 client.newCall(request).execute().use { response ->
                     val responseBody = response.body?.string().orEmpty()
                     if (!response.isSuccessful) {
+                        DebugLog.alwaysW(TAG, "llm_output http=${response.code} (request failed)")
+                        logLongField(TAG, "llm_transcript", context.transcript.trim())
+                        logLongField(TAG, "llm_response_body", responseBody)
                         mainHandler.post { callback(defaultRoutingDecision(context.transcript), true) }
                         return@use
                     }
@@ -67,11 +75,18 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                                     ?.optJSONObject("message")
                                     ?.optString("content")
                                     .orEmpty()
+                    DebugLog.alwaysI(TAG, "llm_output http=${response.code} (assistant JSON)")
+                    logLongField(TAG, "llm_transcript", context.transcript.trim())
+                    logLongField(TAG, "llm_response_content", content)
                     if (content.isBlank()) {
                         mainHandler.post { callback(defaultRoutingDecision(context.transcript), true) }
                         return@use
                     }
                     val parsed = parseRoutingContent(content)
+                    DebugLog.alwaysI(
+                            TAG,
+                            "llm_decision parsed=${parsed != null} action=${parsed?.action} target=${parsed?.routeTarget} dashboardId=${parsed?.dashboardId} agentId=${parsed?.agentId} confidence=${parsed?.confidence} message=\"${parsed?.message?.trim()?.take(260)}\""
+                    )
                     mainHandler.post {
                         if (parsed != null) callback(parsed, false)
                         else callback(defaultRoutingDecision(context.transcript), true)
@@ -173,9 +188,13 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                 "You are a voice routing policy engine. Return JSON only. " +
                         "Choose action from: NAVIGATE_DASHBOARD_LIST, NAVIGATE_DASHBOARD_DETAIL, NAVIGATE_AGENT_LIST, NAVIGATE_AGENT_DETAIL, NAVIGATE_CONVERSATION_NEW, CHAT_IN_CURRENT_CONVERSATION, CHAT_WITH_AGENT_SWITCH, DICTATE_TEXT, NO_OP. " +
                         "Use dashboard_id only from dashboards[].dashboard_id. Use agent_id only from agents[].id. Never invent ids. " +
+                        "For explicit list navigation requests, always return list actions even when candidates are empty: " +
+                        "dashboard list command => NAVIGATE_DASHBOARD_LIST; agents list command => NAVIGATE_AGENT_LIST. " +
                         "For dashboard detail use dashboard_id when user asks open/detail a specific dashboard. " +
                         "For agent detail use agent_id when user asks open/detail a specific agent. " +
+                        "Detail actions require IDs. If ID cannot be resolved for detail actions, return NO_OP. " +
                         "When in conversation: continue same thread => CHAT_IN_CURRENT_CONVERSATION; if user wants another agent => CHAT_WITH_AGENT_SWITCH. " +
+                        "If user asks to switch assistant but no specific agent id can be resolved, still use CHAT_WITH_AGENT_SWITCH with agent_id=null and keep message. " +
                         "If ambiguous or insufficient confidence return NO_OP with empty ids. " +
                         "Keep message in original language and strip routing wrappers."
         val messages =
@@ -193,6 +212,30 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
             put("temperature", 0)
             put("messages", messages)
             put("response_format", responseFormat)
+        }
+    }
+
+    /** Android Log truncates long lines; split so transcript / JSON content stay readable in logcat. */
+    private fun logLongField(tag: String, label: String, value: String, maxChunk: Int = 3800) {
+        if (value.isEmpty()) {
+            DebugLog.alwaysI(tag, "$label=(empty)")
+            return
+        }
+        if (value.length <= maxChunk) {
+            DebugLog.alwaysI(tag, "$label=$value")
+            return
+        }
+        val totalParts = (value.length + maxChunk - 1) / maxChunk
+        var offset = 0
+        var partIndex = 0
+        while (offset < value.length) {
+            val end = minOf(offset + maxChunk, value.length)
+            DebugLog.alwaysI(
+                    tag,
+                    "$label part=${partIndex + 1}/$totalParts ${value.substring(offset, end)}"
+            )
+            offset = end
+            partIndex++
         }
     }
 
@@ -239,7 +282,7 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
     companion object {
         private const val TAG = "GroqChatService"
         private const val CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
-        private const val MODEL_STRICT_SMALL = "openai/gpt-oss-120b"
+        private const val MODEL_STRICT_SMALL = "openai/gpt-oss-20b"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 }

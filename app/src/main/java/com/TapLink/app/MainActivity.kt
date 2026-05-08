@@ -410,6 +410,8 @@ class MainActivity :
     private var cachedDashboards: List<DashboardCandidate> = emptyList()
     private var lastKnownDashboards: List<DashboardCandidate> = emptyList()
     private var cachedDashboardsAt: Long = 0L
+    private var agentsCacheRefreshInFlight = false
+    private var dashboardCacheRefreshInFlight = false
     // Bumps for each voice->chat command so stale async callbacks cannot send older text later.
     private var chatVoicePipelineGeneration: Long = 0L
     /** After full [WebView.loadUrl] to the conversation route, run voice follow-up (SPA uses in-callback). */
@@ -2324,8 +2326,12 @@ class MainActivity :
                             handleVoiceResult(text)
                         }
                     },
+                    onPrepareAudioCapture = { setVoiceAssistantAudioRoute(true) },
                     onRecordingUiActive = { active ->
-                        runOnUiThread { dualWebViewGroup.setVoiceRecordingIndicator(active) }
+                        runOnUiThread {
+                            if (!active) setVoiceAssistantAudioRoute(false)
+                            dualWebViewGroup.setVoiceRecordingIndicator(active)
+                        }
                     }
             )
         }
@@ -2427,9 +2433,9 @@ class MainActivity :
                     0
             )
             audioManager?.setParameters("audio_source_record=$value")
-            DebugLog.d("AudioRoute", "audio_source_record=$value")
+            DebugLog.i("VoiceRouting", "audio_source_record=$value")
         } catch (e: Exception) {
-            DebugLog.e("AudioRoute", "Failed to set audio route: $value", e)
+            DebugLog.e("VoiceRouting", "Failed to set audio route: $value", e)
         }
     }
 
@@ -2445,6 +2451,9 @@ class MainActivity :
                 "SpeechRecognition",
                 "onMicrophonePressed called, isListening: $isListeningForSpeech"
         )
+        if (voiceInputController.supportsTempleHoldToTalk()) {
+            setVoiceAssistantAudioRoute(true)
+        }
         // Keyboard mic is for text input, not wake/routing
         voiceInputController.startListening(
                 armWakeRouting = false,
@@ -2457,6 +2466,9 @@ class MainActivity :
             if (!hasWindowFocus() || !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                 dualWebViewGroup.showToast("Return to the app, then use Voice")
                 return@runOnUiThread
+            }
+            if (voiceInputController.supportsTempleHoldToTalk()) {
+                setVoiceAssistantAudioRoute(true)
             }
             voiceInputController.startListening(
                     armWakeRouting = true,
@@ -2778,11 +2790,54 @@ class MainActivity :
         val dashboards = if (cachedDashboards.isNotEmpty()) cachedDashboards else lastKnownDashboards
         val validation = RoutingDecisionValidator.validate(rawDecision, agents, dashboards)
         val decision = validation.sanitized
+        val isInConversationNow =
+                webView.url.orEmpty().startsWith(conversationRouteUrl, ignoreCase = true)
         DebugLog.i(
                 "VoiceRouting",
-                "decision action=${rawDecision.action} validated=${validation.accepted} error=${validation.error} routeTarget=${decision.routeTarget} dashboardId=${decision.dashboardId} agentId=${decision.agentId} confidence=${decision.confidence} reason=${decision.reasonCode} failed=$modelFailed"
+                "decision transcript=\"${transcript.trim().take(220)}\" action=${rawDecision.action} rawMessage=\"${rawDecision.message.trim().take(220)}\" validated=${validation.accepted} error=${validation.error} routeTarget=${decision.routeTarget} dashboardId=${decision.dashboardId} agentId=${decision.agentId} confidence=${decision.confidence} reason=${decision.reasonCode} finalMessage=\"${decision.message.trim().take(220)}\" failed=$modelFailed"
         )
         if (!validation.accepted || decision.action == RoutingAction.NO_OP) {
+            val normalizedLower = normalized.lowercase(Locale.US)
+            if (decision.action == RoutingAction.NO_OP &&
+                            (normalizedLower.contains("dashboard") ||
+                                    normalizedLower.contains("bang dieu khien"))
+            ) {
+                DebugLog.i("VoiceRouting", "NO_OP fallback -> NAVIGATE_DASHBOARD_LIST")
+                navigateRouteWithoutReload(RoutingUrlBuilder.buildDashboardListUrl(appOriginUrl)) {
+                    injectDashboardScraper(webView)
+                    scheduleDashboardCacheRefresh(0)
+                }
+                wakeWordArmed = false
+                return
+            }
+            if (decision.action == RoutingAction.NO_OP &&
+                            (normalizedLower.contains("agent") ||
+                                    normalizedLower.contains("assistant") ||
+                                    normalizedLower.contains("assistance") ||
+                                    normalizedLower.contains("tro ly"))
+            ) {
+                DebugLog.i("VoiceRouting", "NO_OP fallback -> NAVIGATE_AGENT_LIST")
+                navigateRouteWithoutReload(RoutingUrlBuilder.buildAgentListUrl(appOriginUrl)) {
+                    injectAgentsListScraper(webView)
+                    scheduleAgentsCacheRefresh(0)
+                }
+                wakeWordArmed = false
+                return
+            }
+            val fallbackMessage = sanitizeRoutingMessage(transcript)
+            if (decision.action == RoutingAction.NO_OP &&
+                            isInConversationNow &&
+                            fallbackMessage.isNotBlank()
+            ) {
+                DebugLog.i("VoiceRouting", "NO_OP in conversation -> fallback send current chat")
+                executeConversationFromDecision(
+                        message = fallbackMessage,
+                        targetAgentId = null,
+                        alreadyOnChat = true
+                )
+                wakeWordArmed = false
+                return
+            }
             dualWebViewGroup.showToast("Cannot match action", 1600L)
             wakeWordArmed = false
             return
@@ -2815,6 +2870,7 @@ class MainActivity :
             RoutingAction.NAVIGATE_AGENT_LIST -> {
                 navigateRouteWithoutReload(RoutingUrlBuilder.buildAgentListUrl(appOriginUrl)) {
                     injectAgentsListScraper(webView)
+                    scheduleAgentsCacheRefresh(0)
                 }
             }
             RoutingAction.NAVIGATE_AGENT_DETAIL -> {
@@ -2860,6 +2916,9 @@ class MainActivity :
                         targetAgentId = decision.agentId,
                         alreadyOnChat = alreadyOnChat
                 )
+                if (decision.agentId.isNullOrBlank()) {
+                    dualWebViewGroup.showToast("Agent not specified. Sending in current chat.", 1800L)
+                }
             }
             RoutingAction.DICTATE_TEXT -> {
                 applyDictationFallback(transcript)
@@ -2921,6 +2980,7 @@ class MainActivity :
             return
         }
         injectChatAgentScraper(webView)
+        scheduleAgentsCacheRefresh(0)
         val candidates = if (cachedChatAgents.isNotEmpty()) cachedChatAgents else lastKnownChatAgents
         val resolvedAgent = findAgentById(candidates, targetAgentId)
         if (resolvedAgent != null) {
@@ -3138,12 +3198,37 @@ class MainActivity :
                         )
                     }
                 }
-                cachedChatAgents = out
                 if (out.isNotEmpty()) {
+                    cachedChatAgents = out
                     lastKnownChatAgents = out
+                    agentsCacheRefreshInFlight = false
+                    val preview =
+                            out.take(8).joinToString(", ") { a ->
+                                "${a.id ?: "?"}:${a.name.trim().take(40)}"
+                            }
+                    DebugLog.i(
+                            "ChatAgents",
+                            "agents cached count=${out.size} preview=[$preview${if (out.size > 8) ", …" else ""}]"
+                    )
+                } else {
+                    if (cachedChatAgents.isEmpty()) {
+                        DebugLog.i(
+                                "ChatAgents",
+                                "cacheChatAgentsFromJs empty; no prior cache (voice routing has no agent list yet)"
+                        )
+                    } else {
+                        DebugLog.d(
+                                "ChatAgents",
+                                "cacheChatAgentsFromJs scrape empty; keeping prior cache count=${cachedChatAgents.size}"
+                        )
+                    }
                 }
-                cachedChatAgentsAt = SystemClock.elapsedRealtime()
+                if (out.isNotEmpty()) {
+                    cachedChatAgentsAt = SystemClock.elapsedRealtime()
+                }
+                DebugLog.i("ChatAgents", "cacheChatAgentsFromJs size=${out.size}")
             } catch (e: Exception) {
+                agentsCacheRefreshInFlight = false
                 DebugLog.e("ChatAgents", "cacheChatAgentsFromJs", e)
             }
         }
@@ -3169,13 +3254,37 @@ class MainActivity :
                         )
                     }
                 }
-                cachedDashboards = out
                 if (out.isNotEmpty()) {
+                    cachedDashboards = out
                     lastKnownDashboards = out
+                    dashboardCacheRefreshInFlight = false
+                    val preview =
+                            out.take(8).joinToString(", ") { d ->
+                                "${d.dashboardId}:${d.title.trim().take(40)}"
+                            }
+                    DebugLog.i(
+                            "Dashboards",
+                            "dashboards cached count=${out.size} preview=[$preview${if (out.size > 8) ", …" else ""}]"
+                    )
+                } else {
+                    if (cachedDashboards.isEmpty()) {
+                        DebugLog.i(
+                                "Dashboards",
+                                "cacheDashboardsFromJs empty; no prior cache (voice routing has no dashboard list yet)"
+                        )
+                    } else {
+                        DebugLog.d(
+                                "Dashboards",
+                                "cacheDashboardsFromJs scrape empty; keeping prior cache count=${cachedDashboards.size}"
+                        )
+                    }
                 }
-                cachedDashboardsAt = SystemClock.elapsedRealtime()
+                if (out.isNotEmpty()) {
+                    cachedDashboardsAt = SystemClock.elapsedRealtime()
+                }
                 DebugLog.i("Dashboards", "cacheDashboardsFromJs size=${out.size}")
             } catch (e: Exception) {
+                dashboardCacheRefreshInFlight = false
                 DebugLog.e("Dashboards", "cacheDashboardsFromJs", e)
             }
         }
@@ -3235,8 +3344,9 @@ class MainActivity :
                 """
             (function(){
               function send(list){
+                if (!list || !list.length) return;
                 if (window.AndroidInterface && window.AndroidInterface.cacheDashboards) {
-                  window.AndroidInterface.cacheDashboards(JSON.stringify(list || []));
+                  window.AndroidInterface.cacheDashboards(JSON.stringify(list));
                 }
               }
               function fromHref(href){
@@ -3302,8 +3412,18 @@ class MainActivity :
     }
 
     private fun scheduleDashboardCacheRefresh(attempt: Int = 0) {
-        if (cachedDashboards.isNotEmpty()) return
-        if (attempt > 8) return
+        if (cachedDashboards.isNotEmpty()) {
+            dashboardCacheRefreshInFlight = false
+            return
+        }
+        if (attempt == 0) {
+            if (dashboardCacheRefreshInFlight) return
+            dashboardCacheRefreshInFlight = true
+        }
+        if (attempt > 8) {
+            dashboardCacheRefreshInFlight = false
+            return
+        }
         injectDashboardScraper(webView)
         val delayMs =
                 when {
@@ -3316,6 +3436,41 @@ class MainActivity :
                     if (cachedDashboards.isEmpty()) {
                         DebugLog.i("Dashboards", "dashboard cache retry attempt=${attempt + 1}")
                         scheduleDashboardCacheRefresh(attempt + 1)
+                    } else {
+                        dashboardCacheRefreshInFlight = false
+                    }
+                },
+                delayMs
+        )
+    }
+
+    private fun scheduleAgentsCacheRefresh(attempt: Int = 0) {
+        if (cachedChatAgents.isNotEmpty()) {
+            agentsCacheRefreshInFlight = false
+            return
+        }
+        if (attempt == 0) {
+            if (agentsCacheRefreshInFlight) return
+            agentsCacheRefreshInFlight = true
+        }
+        if (attempt > 8) {
+            agentsCacheRefreshInFlight = false
+            return
+        }
+        injectAgentsListScraper(webView)
+        val delayMs =
+                when {
+                    attempt < 2 -> 350L
+                    attempt < 5 -> 500L
+                    else -> 700L
+                }
+        webView.postDelayed(
+                {
+                    if (cachedChatAgents.isEmpty()) {
+                        DebugLog.i("ChatAgents", "agents cache retry attempt=${attempt + 1}")
+                        scheduleAgentsCacheRefresh(attempt + 1)
+                    } else {
+                        agentsCacheRefreshInFlight = false
                     }
                 },
                 delayMs
@@ -3328,9 +3483,19 @@ class MainActivity :
                 """
             (function(){
               function send(list){
+                if (!list || !list.length) return;
                 if (window.AndroidInterface && window.AndroidInterface.cacheChatAgents) {
-                  window.AndroidInterface.cacheChatAgents(JSON.stringify(list || []));
+                  window.AndroidInterface.cacheChatAgents(JSON.stringify(list));
                 }
+              }
+              function firstText(){
+                for (var i = 0; i < arguments.length; i++) {
+                  var v = arguments[i];
+                  if (!v) continue;
+                  var s = String(v).trim();
+                  if (s) return s;
+                }
+                return '';
               }
               function parseAgentId(href){
                 if (!href) return null;
@@ -3340,29 +3505,43 @@ class MainActivity :
               }
               function scrapeOnce(){
                 var out = [];
-                var cards = Array.from(document.querySelectorAll('.agent-card'));
-                cards.forEach(function(el){
+                var agentCards = Array.from(document.querySelectorAll('.agent-card[data-agent-id]'));
+                agentCards.forEach(function(el){
                   var id = String(el.getAttribute('data-agent-id') || '').trim();
                   if (!id) return;
-                  var name = (el.getAttribute('data-agent-name') || el.getAttribute('title') || el.innerText || '')
-                    .trim().split('\n')[0].trim();
-                  if (!name) return;
+                  var name = firstText(
+                    el.getAttribute('data-agent-name'),
+                    el.querySelector('[data-agent-name]') && el.querySelector('[data-agent-name]').textContent,
+                    el.querySelector('.agent-name, h1, h2, h3, h4, h5, h6') && el.querySelector('.agent-name, h1, h2, h3, h4, h5, h6').textContent,
+                    el.getAttribute('title'),
+                    el.textContent,
+                    id
+                  ).split('\n')[0].trim();
                   out.push({ id: id, name: name, description: '' });
                 });
                 var links = Array.from(document.querySelectorAll('a[href*="/assistant/agents/"]'));
                 links.forEach(function(a){
                   var id = parseAgentId(a.getAttribute('href') || a.href || '');
                   if (!id) return;
-                  var name = (a.innerText || a.getAttribute('title') || '').trim().split('\n')[0].trim();
-                  if (!name) return;
+                  var name = firstText(
+                    a.getAttribute('data-agent-name'),
+                    a.innerText,
+                    a.textContent,
+                    a.getAttribute('title'),
+                    id
+                  ).split('\n')[0].trim();
                   out.push({ id: id, name: name, description: '' });
                 });
-                var cards = Array.from(document.querySelectorAll('[data-agent-id]'));
-                cards.forEach(function(el){
+                var dataCards = Array.from(document.querySelectorAll('[data-agent-id]'));
+                dataCards.forEach(function(el){
                   var id = String(el.getAttribute('data-agent-id') || '').trim();
                   if (!id) return;
-                  var name = (el.getAttribute('data-agent-name') || el.innerText || '').trim().split('\n')[0].trim();
-                  if (!name) return;
+                  var name = firstText(
+                    el.getAttribute('data-agent-name'),
+                    el.getAttribute('title'),
+                    el.textContent,
+                    id
+                  ).split('\n')[0].trim();
                   out.push({ id: id, name: name, description: '' });
                 });
                 var seen = {};
@@ -5069,6 +5248,7 @@ class MainActivity :
                                 maybePerformAutoLogin(view, url)
                                 if (url.startsWith(conversationRouteUrl, ignoreCase = true)) {
                                     injectChatAgentScraper(view)
+                                    scheduleAgentsCacheRefresh(0)
                                     pendingConversationNavigationComplete?.let { cb ->
                                         pendingConversationNavigationComplete = null
                                         webView.postDelayed(cb, 400L)
@@ -5076,6 +5256,7 @@ class MainActivity :
                                 }
                                 if (url.startsWith(agentsRouteUrl, ignoreCase = true)) {
                                     injectAgentsListScraper(view)
+                                    scheduleAgentsCacheRefresh(0)
                                 }
                                 if (url.startsWith(dashboardRouteUrl, ignoreCase = true)) {
                                     injectDashboardScraper(view)

@@ -1,6 +1,7 @@
 package com.TapLinkX3.app
 
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
@@ -29,6 +30,8 @@ class GroqAudioService(private val context: Context) {
     private var outputFile: File? = null
     private var isRecording = false
     private var recordingStartedAtMs: Long = 0L
+    private var preferredAudioSource: Int = MediaRecorder.AudioSource.VOICE_RECOGNITION
+    private var consecutiveNoSpeechDetections: Int = 0
     private val mainHandler = Handler(Looper.getMainLooper())
     private var listener: TranscriptionListener? = null
     private var maxRecordingAbortRunnable: Runnable? = null
@@ -67,33 +70,57 @@ class GroqAudioService(private val context: Context) {
 
     fun startRecording() {
         if (isRecording) return
-        try {
-            outputFile = File.createTempFile("groq_recording_", ".m4a", context.cacheDir)
-            mediaRecorder =
+        outputFile = File.createTempFile("groq_recording_", ".m4a", context.cacheDir)
+        val targetPath = outputFile?.absolutePath
+        var lastError: Exception? = null
+        for (source in candidateAudioSources()) {
+            val recorder =
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         MediaRecorder(context)
                     } else {
                         @Suppress("DEPRECATION") MediaRecorder()
                     }
-
-            mediaRecorder?.apply {
-                setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioEncodingBitRate(128000)
-                setAudioSamplingRate(44100)
-                setOutputFile(outputFile?.absolutePath)
-                prepare()
-                start()
+            try {
+                recorder.apply {
+                    setAudioSource(source)
+                    setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    setAudioEncodingBitRate(128000)
+                    setAudioSamplingRate(44100)
+                    setOutputFile(targetPath)
+                    prepare()
+                    start()
+                }
+                mediaRecorder = recorder
+                preferredAudioSource = source
+                DebugLog.i(
+                        "GroqAudioService",
+                        "startRecording source=${audioSourceName(source)} noSpeechStreak=$consecutiveNoSpeechDetections"
+                )
+                recordingStartedAtMs = SystemClock.elapsedRealtime()
+                isRecording = true
+                scheduleMaxRecordingAbort()
+                mainHandler.post { listener?.onRecordingStart() }
+                return
+            } catch (e: Exception) {
+                lastError = e
+                DebugLog.w(
+                        "GroqAudioService",
+                        "startRecording source=${audioSourceName(source)} failed: ${e.message}"
+                )
+                try {
+                    recorder.release()
+                } catch (_: Exception) {}
             }
-            recordingStartedAtMs = SystemClock.elapsedRealtime()
-            isRecording = true
-            scheduleMaxRecordingAbort()
-            mainHandler.post { listener?.onRecordingStart() }
-        } catch (e: Exception) {
-            releaseRecorder()
-            mainHandler.post { listener?.onError("Failed to start recording: ${e.message}") }
         }
+        releaseRecorder()
+        outputFile?.let {
+            try {
+                it.delete()
+            } catch (_: Exception) {}
+        }
+        outputFile = null
+        mainHandler.post { listener?.onError("Failed to start recording: ${lastError?.message}") }
     }
 
     fun currentAmplitude(): Int {
@@ -125,10 +152,13 @@ class GroqAudioService(private val context: Context) {
     fun stopRecordingAndTranscribe(languageHint: String? = null) {
         if (!isRecording) return
         cancelMaxRecordingAbort()
+        var stopFailed = false
         try {
             mediaRecorder?.stop()
-        } catch (_: RuntimeException) {
-            // Stop may throw if recording is too short; we handle via file checks below.
+        } catch (e: RuntimeException) {
+            // On many devices this means clip is too short/corrupt; do not upload.
+            stopFailed = true
+            DebugLog.w("GroqAudioService", "mediaRecorder.stop() failed: ${e.message}")
         } finally {
             releaseRecorder()
             isRecording = false
@@ -140,9 +170,19 @@ class GroqAudioService(private val context: Context) {
             return
         }
 
-        val durationMs = SystemClock.elapsedRealtime() - recordingStartedAtMs
+        val elapsedMs = SystemClock.elapsedRealtime() - recordingStartedAtMs
+        val mediaDurationMs = readMediaDurationMs(file)
+        val durationMs = mediaDurationMs?.takeIf { it > 0 } ?: elapsedMs
         val sizeBytes = file.length()
-        if (!file.exists() || sizeBytes <= 512L || durationMs < MIN_DURATION_MS) {
+        DebugLog.i(
+                "GroqAudioService",
+                "stopRecordingAndTranscribe file=${file.name} sizeBytes=$sizeBytes elapsedMs=$elapsedMs mediaDurationMs=${mediaDurationMs ?: -1} stopFailed=$stopFailed"
+        )
+        if (stopFailed ||
+                !file.exists() ||
+                sizeBytes < MIN_UPLOAD_BYTES ||
+                durationMs < MIN_DURATION_MS
+        ) {
             file.delete()
             mainHandler.post {
                 listener?.onError(
@@ -195,6 +235,12 @@ class GroqAudioService(private val context: Context) {
             try {
                 mainHandler.post { listener?.onTranscribing() }
                 val language = languageHint ?: Locale.getDefault().language
+                val fileSize = file.length()
+                val fileDurationMs = readMediaDurationMs(file) ?: -1L
+                DebugLog.i(
+                        "GroqAudioService",
+                        "stt_request file=${file.name} sizeBytes=$fileSize mediaDurationMs=$fileDurationMs language=$language source=${audioSourceName(preferredAudioSource)} noSpeechStreak=$consecutiveNoSpeechDetections"
+                )
                 val requestBodyBuilder =
                         MultipartBody.Builder()
                                 .setType(MultipartBody.FORM)
@@ -220,6 +266,10 @@ class GroqAudioService(private val context: Context) {
                 client.newCall(request).execute().use { response ->
                     val responseBody = response.body?.string().orEmpty()
                     if (!response.isSuccessful) {
+                        DebugLog.w(
+                                "GroqAudioService",
+                                "stt_response errorCode=${response.code} body=${responseBody.take(220)}"
+                        )
                         mainHandler.post {
                             listener?.onError(
                                     "Groq STT API error: ${response.code}. ${responseBody.take(160)}"
@@ -228,9 +278,14 @@ class GroqAudioService(private val context: Context) {
                         return@use
                     }
                     val text = JSONObject(responseBody).optString("text", "").trim()
+                    DebugLog.i(
+                            "GroqAudioService",
+                            "stt_response success text=\"${text.take(220)}\" raw=${responseBody.take(220)}"
+                    )
                     if (text.isBlank()) {
                         mainHandler.post { listener?.onError("No text transcribed.") }
                     } else {
+                        consecutiveNoSpeechDetections = 0
                         mainHandler.post { listener?.onTranscriptionResult(text) }
                     }
                 }
@@ -244,12 +299,62 @@ class GroqAudioService(private val context: Context) {
         }.start()
     }
 
+    private fun readMediaDurationMs(file: File): Long? {
+        return try {
+            val mmr = MediaMetadataRetriever()
+            mmr.setDataSource(file.absolutePath)
+            val raw = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            mmr.release()
+            raw?.toLongOrNull()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun candidateAudioSources(): List<Int> {
+        val ordered =
+                listOf(
+                        preferredAudioSource,
+                        MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                        MediaRecorder.AudioSource.MIC,
+                        MediaRecorder.AudioSource.DEFAULT
+                )
+        return ordered.distinct()
+    }
+
+    private fun audioSourceName(source: Int): String =
+            when (source) {
+                MediaRecorder.AudioSource.VOICE_RECOGNITION -> "VOICE_RECOGNITION"
+                MediaRecorder.AudioSource.MIC -> "MIC"
+                MediaRecorder.AudioSource.DEFAULT -> "DEFAULT"
+                else -> source.toString()
+            }
+
+    fun reportNoSpeechDetected() {
+        consecutiveNoSpeechDetections += 1
+        if (preferredAudioSource == MediaRecorder.AudioSource.VOICE_RECOGNITION &&
+                consecutiveNoSpeechDetections >= 2
+        ) {
+            preferredAudioSource = MediaRecorder.AudioSource.MIC
+            DebugLog.w(
+                    "GroqAudioService",
+                    "No-speech streak=$consecutiveNoSpeechDetections, switching preferred source to MIC"
+            )
+        } else {
+            DebugLog.i(
+                    "GroqAudioService",
+                    "No-speech streak=$consecutiveNoSpeechDetections source=${audioSourceName(preferredAudioSource)}"
+            )
+        }
+    }
+
     companion object {
         private const val PREFS = "TapLinkPrefs"
         private const val KEY_GROQ_API_KEY = "groq_api_key"
         private const val TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
         private const val MODEL_DEFAULT = "whisper-large-v3-turbo"
         private const val MIN_DURATION_MS = 1000L
+        private const val MIN_UPLOAD_BYTES = 8L * 1024L
         /** Avoid endless recording if the user forgets to tap again to stop. */
         private const val MAX_RECORDING_DURATION_MS = 120_000L
         private const val MAX_UPLOAD_BYTES = 24L * 1024L * 1024L // Leave headroom for free tier.

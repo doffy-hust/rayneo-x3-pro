@@ -23,7 +23,6 @@ import android.text.TextWatcher
 import android.text.method.ScrollingMovementMethod
 import android.util.AttributeSet
 import android.util.Base64
-import android.util.Log
 import android.view.GestureDetector
 import android.view.HapticFeedbackConstants
 import android.view.Gravity
@@ -48,6 +47,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import kotlin.math.roundToInt
 import org.json.JSONObject
+
+private object Log {
+    fun e(tag: String, message: String, throwable: Throwable? = null) {}
+
+    fun w(tag: String, message: String, throwable: Throwable? = null) {}
+}
 
 @SuppressLint("ClickableViewAccessibility")
 class DualWebViewGroup
@@ -1936,7 +1941,7 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                             view?.let { injectPageObservers(it) }
                             updateScrollBarsVisibility()
                         } catch (e: Exception) {
-                            android.util.Log.e("TapLink", "Error in onPageFinished", e)
+                            Log.e("TapLink", "Error in onPageFinished", e)
                         }
                     }
                 }
@@ -2790,10 +2795,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         val activity =
                 context as? Activity
                         ?: run {
-                            Log.w(
-                                    "FullscreenDebug",
-                                    "Cannot hide system UI - context is not an Activity"
-                            )
                             return
                         }
 
@@ -2814,7 +2815,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                                         .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                         DebugLog.d("FullscreenDebug", "System UI hidden (API 30+)")
                     }
-                            ?: Log.w("FullscreenDebug", "WindowInsetsController is null!")
                 } else {
                     // Older Android versions - Use deprecated flags
                     @Suppress("DEPRECATION")
@@ -2837,10 +2837,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         val activity =
                 context as? Activity
                         ?: run {
-                            Log.w(
-                                    "FullscreenDebug",
-                                    "Cannot show system UI - context is not an Activity"
-                            )
                             return
                         }
 
@@ -3418,20 +3414,13 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                         bitmapToUse,
                         { copyResult ->
                             // Log PixelCopy result for debugging
-                            if (copyResult != PixelCopy.SUCCESS) {
-                                Log.w("MirrorDebug", "PixelCopy failed with result: $copyResult")
-                            }
+                            if (copyResult != PixelCopy.SUCCESS) {}
 
                             if (copyResult == PixelCopy.SUCCESS && isRefreshing) {
                                 synchronized(bitmapLock) {
                                     if (!bitmapToUse.isRecycled && bitmap === bitmapToUse) {
                                         drawBitmapToSurface()
                                         lastCaptureTime = System.currentTimeMillis()
-                                    } else {
-                                        Log.w(
-                                                "MirrorDebug",
-                                                "Bitmap state issue - recycled: ${bitmapToUse.isRecycled}, same: ${bitmap === bitmapToUse}"
-                                        )
                                     }
                                 }
                             }
@@ -3498,7 +3487,6 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                         }
                         refreshHandler.postDelayed(this, refreshInterval)
                     } else {
-                        Log.w("MirrorDebug", "RefreshLoop STOPPING! isRefreshing=$isRefreshing")
                         // No need to call stopRefreshing() here as we just stop posting callbacks
                     }
                 }
