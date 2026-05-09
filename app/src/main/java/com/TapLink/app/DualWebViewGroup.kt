@@ -2791,6 +2791,11 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
         updateRefreshRate()
     }
 
+    fun triggerFullscreenUi() {
+        hideSystemUI()
+        postDelayed({ hideSystemUI() }, 120)
+    }
+
     private fun hideSystemUI() {
         val activity =
                 context as? Activity
@@ -3638,29 +3643,29 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                 eyeHeight
         )
 
-        // Position ProgressBar - at bottom in scroll mode, above nav bar otherwise
+        // Position ProgressBar in header area (top) for both modes
         val progressBarHeight = 4
         if (isInScrollMode) {
-            // In scroll mode, position at very bottom, full width
+            // In scroll mode, keep full-width at the top edge
             progressBar.measure(
                     MeasureSpec.makeMeasureSpec(halfWidth, MeasureSpec.EXACTLY),
                     MeasureSpec.makeMeasureSpec(progressBarHeight, MeasureSpec.EXACTLY)
             )
             if (progressBar.visibility == View.VISIBLE) {
-                val pbY = eyeHeight - progressBarHeight
-                progressBar.layout(0, pbY, halfWidth, eyeHeight)
+                val pbY = 0
+                progressBar.layout(0, pbY, halfWidth, pbY + progressBarHeight)
                 progressBar.bringToFront()
             } else {
                 progressBar.layout(0, 0, 0, 0)
             }
         } else {
-            // Normal mode - position above navigation bar
+            // Normal mode - align with content header (after toggle bar)
             progressBar.measure(
                     MeasureSpec.makeMeasureSpec(halfWidth - toggleBarWidth, MeasureSpec.EXACTLY),
                     MeasureSpec.makeMeasureSpec(progressBarHeight, MeasureSpec.EXACTLY)
             )
             if (progressBar.visibility == View.VISIBLE) {
-                val pbY = eyeHeight - navBarHeight - progressBarHeight
+                val pbY = 0
                 progressBar.layout(toggleBarWidth, pbY, halfWidth, pbY + progressBarHeight)
             } else {
                 progressBar.layout(0, 0, 0, 0)
@@ -3753,8 +3758,9 @@ constructor(context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
                 )
             }
 
-            // Show navigation bar only in normal mode (hide in scroll mode to avoid overlap)
-            if (isInScrollMode) {
+            // Show navigation bar only in normal mode.
+            // Keep it hidden when nav bars are explicitly hidden.
+            if (isInScrollMode || isNavBarsHidden) {
                 leftNavigationBar.visibility = View.GONE
                 leftNavigationBar.layout(0, 0, 0, 0)
             } else {

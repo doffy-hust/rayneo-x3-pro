@@ -195,6 +195,10 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                         "Detail actions require IDs. If ID cannot be resolved for detail actions, return NO_OP. " +
                         "When in conversation: continue same thread => CHAT_IN_CURRENT_CONVERSATION; if user wants another agent => CHAT_WITH_AGENT_SWITCH. " +
                         "If user asks to switch assistant but no specific agent id can be resolved, still use CHAT_WITH_AGENT_SWITCH with agent_id=null and keep message. " +
+                        "For CHAT_* actions, message must be request-only content (question/task), never the full command transcript. " +
+                        "If user only asks to open chat/conversation without a question, use NAVIGATE_CONVERSATION_NEW and message=\"\". " +
+                        "Example: \"Go chat and ask Peter what time is it\" => action CHAT_WITH_AGENT_SWITCH (or CHAT_IN_CURRENT_CONVERSATION if agent unresolved), message \"what time is it\". " +
+                        "Example: \"go chat\" => action NAVIGATE_CONVERSATION_NEW, message \"\". " +
                         "If ambiguous or insufficient confidence return NO_OP with empty ids. " +
                         "Keep message in original language and strip routing wrappers."
         val messages =
@@ -282,7 +286,7 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
     companion object {
         private const val TAG = "GroqChatService"
         private const val CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
-        private const val MODEL_STRICT_SMALL = "openai/gpt-oss-20b"
+        private const val MODEL_STRICT_SMALL = "openai/gpt-oss-120b"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 }

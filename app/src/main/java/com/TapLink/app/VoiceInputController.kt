@@ -79,7 +79,14 @@ class GroqVoiceInputController(
         lastListenOptions = options
         pendingArmWakeRouting = armWakeRouting
         if (groqAudioService.isRecording()) {
-            toast("Listening. Stop speaking for 1-2 seconds.", TOAST_SHORT_MS)
+            if (manualCaptureActive || commandCaptureActive) {
+                resetManualCaptureState()
+                resetCommandCaptureState()
+                toast("Transcribing…", TOAST_SHORT_MS)
+                groqAudioService.stopRecordingAndTranscribe()
+                return
+            }
+            toast("Listening...", TOAST_SHORT_MS)
             return
         }
         if (!groqAudioService.hasApiKey()) {

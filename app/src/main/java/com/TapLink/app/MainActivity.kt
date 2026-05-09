@@ -416,6 +416,8 @@ class MainActivity :
     private var chatVoicePipelineGeneration: Long = 0L
     /** After full [WebView.loadUrl] to the conversation route, run voice follow-up (SPA uses in-callback). */
     private var pendingConversationNavigationComplete: (() -> Unit)? = null
+    /** After full [WebView.loadUrl] to dashboard detail, run follow-up (SPA uses in-callback). */
+    private var pendingDashboardDetailNavigationComplete: (() -> Unit)? = null
     private val pendingVoiceActions = HashMap<String, PendingVoiceAction>()
     private var webVoiceOrchestratorReady = false
     private var autoLoginAttemptedUrl: String? = null
@@ -531,13 +533,9 @@ class MainActivity :
                 WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
         )
 
-        // Prevent any drawing until we're ready
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            @Suppress("DEPRECATION") window.setDecorFitsSystemWindows(false)
-        }
-
         // Set content view with black background
         setContentView(R.layout.activity_main)
+        applyDefaultFullscreen()
 
         findViewById<View>(android.R.id.content).setBackgroundColor(Color.BLACK)
 
@@ -573,6 +571,11 @@ class MainActivity :
         dualWebViewGroup.maskToggleListener = this
         dualWebViewGroup.windowCallback = this
         dualWebViewGroup.restoreState()
+        dualWebViewGroup.post {
+            // Match bottom-nav "hide" action behavior on startup.
+            dualWebViewGroup.setNavBarsHidden(true)
+            dualWebViewGroup.triggerFullscreenUi()
+        }
 
         // Load saved anchored mode state
         isAnchored =
@@ -700,7 +703,7 @@ class MainActivity :
                                                         SystemClock.uptimeMillis() + 250L
                                                 tapCount = 0
                                                 dualWebViewGroup.showToast(
-                                                        "Listening. Stop speaking for 1-2 seconds.",
+                                                        "Listening...",
                                                         4200L
                                                 )
                                                 requestVoiceRoutingSession(
@@ -1528,6 +1531,11 @@ class MainActivity :
 
     override fun onResume() {
         super.onResume()
+        if (::dualWebViewGroup.isInitialized) {
+            dualWebViewGroup.triggerFullscreenUi()
+        } else {
+            applyDefaultFullscreen()
+        }
 
         // Register notification receiver
         val filter = IntentFilter(NotificationService.ACTION_NOTIFICATION_POSTED)
@@ -1554,6 +1562,15 @@ class MainActivity :
             }
         }
         // Disabled for now: always-on wake loop was causing noisy auto-detected transcripts.
+    }
+
+    override fun onPostResume() {
+        super.onPostResume()
+        if (::dualWebViewGroup.isInitialized) {
+            dualWebViewGroup.triggerFullscreenUi()
+        } else {
+            applyDefaultFullscreen()
+        }
     }
 
     fun getLastLocation(): Pair<Double, Double>? {
@@ -1705,7 +1722,49 @@ class MainActivity :
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
+            if (::dualWebViewGroup.isInitialized) {
+                dualWebViewGroup.triggerFullscreenUi()
+            } else {
+                applyDefaultFullscreen()
+            }
             webView.requestFocus()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyDefaultFullscreen() {
+        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes =
+                    window.attributes.apply {
+                        layoutInDisplayCutoutMode =
+                                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+            val insetsController = window.insetsController
+            if (insetsController == null) {
+                window.decorView.post { applyDefaultFullscreen() }
+                return
+            }
+            insetsController.hide(
+                    android.view.WindowInsets.Type.statusBars() or
+                            android.view.WindowInsets.Type.navigationBars()
+            )
+            insetsController.systemBarsBehavior =
+                    android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            window.decorView.systemUiVisibility =
+                    (View.SYSTEM_UI_FLAG_FULLSCREEN or
+                            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)
         }
     }
 
@@ -2433,7 +2492,7 @@ class MainActivity :
                     0
             )
             audioManager?.setParameters("audio_source_record=$value")
-            DebugLog.i("VoiceRouting", "audio_source_record=$value")
+            DebugLog.alwaysI("VoiceRouting", "audio_source_record=$value")
         } catch (e: Exception) {
             DebugLog.e("VoiceRouting", "Failed to set audio route: $value", e)
         }
@@ -2512,7 +2571,7 @@ class MainActivity :
             return
         }
         dualWebViewGroup.showToast(
-                "Listening. Stop speaking for 1-2 seconds.",
+                "Listening...",
                 4500L
         )
         requestVoiceRoutingSession(suppressRecordingHintToast = true)
@@ -2736,7 +2795,7 @@ class MainActivity :
         if (text.isBlank()) return
 
         val trimmed = text.trim()
-        DebugLog.d("VoiceTranscript", "STT raw transcript: \"$trimmed\"")
+        DebugLog.alwaysI("VoiceTranscript", "STT raw transcript: \"$trimmed\"")
         val normalized = normalizeVoiceText(trimmed)
         val afterWake = stripWakeCommandPrefix(normalized)
         val wakeWordOnly = utteranceHasWakePrefix(normalized) && afterWake.isBlank()
@@ -2792,17 +2851,23 @@ class MainActivity :
         val decision = validation.sanitized
         val isInConversationNow =
                 webView.url.orEmpty().startsWith(conversationRouteUrl, ignoreCase = true)
-        DebugLog.i(
+        DebugLog.alwaysI(
                 "VoiceRouting",
                 "decision transcript=\"${transcript.trim().take(220)}\" action=${rawDecision.action} rawMessage=\"${rawDecision.message.trim().take(220)}\" validated=${validation.accepted} error=${validation.error} routeTarget=${decision.routeTarget} dashboardId=${decision.dashboardId} agentId=${decision.agentId} confidence=${decision.confidence} reason=${decision.reasonCode} finalMessage=\"${decision.message.trim().take(220)}\" failed=$modelFailed"
         )
         if (!validation.accepted || decision.action == RoutingAction.NO_OP) {
             val normalizedLower = normalized.lowercase(Locale.US)
+            if (decision.action == RoutingAction.NO_OP && isChatNavigationOnlyCommand(normalizedLower)) {
+                DebugLog.alwaysI("VoiceRouting", "NO_OP fallback -> NAVIGATE_CONVERSATION_NEW")
+                navigateRouteWithoutReload(conversationRouteUrl)
+                wakeWordArmed = false
+                return
+            }
             if (decision.action == RoutingAction.NO_OP &&
                             (normalizedLower.contains("dashboard") ||
                                     normalizedLower.contains("bang dieu khien"))
             ) {
-                DebugLog.i("VoiceRouting", "NO_OP fallback -> NAVIGATE_DASHBOARD_LIST")
+                DebugLog.alwaysI("VoiceRouting", "NO_OP fallback -> NAVIGATE_DASHBOARD_LIST")
                 navigateRouteWithoutReload(RoutingUrlBuilder.buildDashboardListUrl(appOriginUrl)) {
                     injectDashboardScraper(webView)
                     scheduleDashboardCacheRefresh(0)
@@ -2816,7 +2881,7 @@ class MainActivity :
                                     normalizedLower.contains("assistance") ||
                                     normalizedLower.contains("tro ly"))
             ) {
-                DebugLog.i("VoiceRouting", "NO_OP fallback -> NAVIGATE_AGENT_LIST")
+                DebugLog.alwaysI("VoiceRouting", "NO_OP fallback -> NAVIGATE_AGENT_LIST")
                 navigateRouteWithoutReload(RoutingUrlBuilder.buildAgentListUrl(appOriginUrl)) {
                     injectAgentsListScraper(webView)
                     scheduleAgentsCacheRefresh(0)
@@ -2824,12 +2889,17 @@ class MainActivity :
                 wakeWordArmed = false
                 return
             }
-            val fallbackMessage = sanitizeRoutingMessage(transcript)
+            val fallbackMessage =
+                    sanitizeChatRequestMessage(
+                            rawMessage = "",
+                            transcript = transcript,
+                            normalizedTranscript = normalized
+                    )
             if (decision.action == RoutingAction.NO_OP &&
                             isInConversationNow &&
                             fallbackMessage.isNotBlank()
             ) {
-                DebugLog.i("VoiceRouting", "NO_OP in conversation -> fallback send current chat")
+                DebugLog.alwaysI("VoiceRouting", "NO_OP in conversation -> fallback send current chat")
                 executeConversationFromDecision(
                         message = fallbackMessage,
                         targetAgentId = null,
@@ -2851,6 +2921,7 @@ class MainActivity :
                 }
             }
             RoutingAction.NAVIGATE_DASHBOARD_DETAIL -> {
+                shouldDispatchToWebOrchestrator = false
                 val item = findDashboardById(dashboards, decision.dashboardId)
                 val target =
                         item?.let {
@@ -2865,7 +2936,7 @@ class MainActivity :
                     wakeWordArmed = false
                     return
                 }
-                navigateRouteWithoutReload(target)
+                navigateRouteWithoutReload(target) { scrollDashboardGridstackToTop(webView) }
             }
             RoutingAction.NAVIGATE_AGENT_LIST -> {
                 navigateRouteWithoutReload(RoutingUrlBuilder.buildAgentListUrl(appOriginUrl)) {
@@ -2883,13 +2954,19 @@ class MainActivity :
                 navigateRouteWithoutReload(target)
             }
             RoutingAction.NAVIGATE_CONVERSATION_NEW -> {
+                shouldDispatchToWebOrchestrator = false
                 navigateRouteWithoutReload(conversationRouteUrl)
             }
             RoutingAction.CHAT_IN_CURRENT_CONVERSATION -> {
                 shouldDispatchToWebOrchestrator = false
-                val message = sanitizeRoutingMessage(decision.message)
+                val message =
+                        sanitizeChatRequestMessage(
+                                rawMessage = decision.message,
+                                transcript = transcript,
+                                normalizedTranscript = normalized
+                        )
                 if (message.isBlank()) {
-                    dualWebViewGroup.showToast("Message is empty", 1600L)
+                    navigateRouteWithoutReload(conversationRouteUrl)
                     wakeWordArmed = false
                     return
                 }
@@ -2903,9 +2980,14 @@ class MainActivity :
             }
             RoutingAction.CHAT_WITH_AGENT_SWITCH -> {
                 shouldDispatchToWebOrchestrator = false
-                val message = sanitizeRoutingMessage(decision.message)
+                val message =
+                        sanitizeChatRequestMessage(
+                                rawMessage = decision.message,
+                                transcript = transcript,
+                                normalizedTranscript = normalized
+                        )
                 if (message.isBlank()) {
-                    dualWebViewGroup.showToast("Message is empty", 1600L)
+                    navigateRouteWithoutReload(conversationRouteUrl)
                     wakeWordArmed = false
                     return
                 }
@@ -2930,7 +3012,7 @@ class MainActivity :
         if (shouldDispatchToWebOrchestrator) {
             val handledByWeb = dispatchVoiceActionToWebOrchestrator(transcript, normalized) {}
             if (handledByWeb) {
-                DebugLog.d("VoiceRouting", "Web orchestrator received decision action=${decision.action}")
+                DebugLog.alwaysI("VoiceRouting", "Web orchestrator received decision action=${decision.action}")
             }
         }
         wakeWordArmed = false
@@ -2939,6 +3021,80 @@ class MainActivity :
     private fun sanitizeRoutingMessage(message: String): String {
         val trimmed = message.trim()
         return if (trimmed.length < 4) "" else trimmed
+    }
+
+    private fun sanitizeChatRequestMessage(
+            rawMessage: String,
+            transcript: String,
+            normalizedTranscript: String
+    ): String {
+        val normalizedRawMessage = normalizeVoiceText(rawMessage)
+        val rawLooksLikeTranscript =
+                normalizedRawMessage.isNotBlank() &&
+                        normalizedRawMessage == normalizedTranscript.trim().lowercase(Locale.US)
+        val primarySource = if (rawLooksLikeTranscript) transcript else rawMessage
+        val requestOnly = sanitizeRoutingMessage(stripChatCommandWrappers(primarySource))
+        if (requestOnly.isNotBlank()) return requestOnly
+        if (rawLooksLikeTranscript) return ""
+        return sanitizeRoutingMessage(stripChatCommandWrappers(transcript))
+    }
+
+    private fun stripChatCommandWrappers(value: String): String {
+        var output = value.trim()
+        if (output.isBlank()) return ""
+        val commandPrefixes =
+                listOf(
+                        Regex(
+                                "^(?:please\\s+)?(?:go|open|navigate(?:\\s+to)?|switch(?:\\s+to)?)\\s+(?:to\\s+)?(?:the\\s+)?(?:chat|conversation)\\b[\\s,.:;!\\-]*(?:and\\s+)?",
+                                RegexOption.IGNORE_CASE
+                        ),
+                        Regex(
+                                "^(?:please\\s+)?(?:chat|conversation)\\b[\\s,.:;!\\-]*(?:and\\s+)?",
+                                RegexOption.IGNORE_CASE
+                        )
+                )
+        var changed = true
+        while (changed) {
+            changed = false
+            for (pattern in commandPrefixes) {
+                val replaced = output.replaceFirst(pattern, "").trim()
+                if (replaced != output) {
+                    output = replaced
+                    changed = true
+                }
+            }
+        }
+        output =
+                output
+                        .replaceFirst(
+                                Regex(
+                                        "^(?:please\\s+)?(?:and\\s+)?(?:ask|tell|message|say\\s+to)\\s+",
+                                        RegexOption.IGNORE_CASE
+                                ),
+                                ""
+                        )
+                        .replaceFirst(
+                                Regex("^(?:[\\p{L}\\p{N}_'\\-]+\\s+){1,3}(?=(?:who|what|when|where|why|how)\\b)", RegexOption.IGNORE_CASE),
+                                ""
+                        )
+                        .trim()
+                        .trimStart(',', '.', ':', ';', '-', ' ')
+                        .trim()
+        return output
+    }
+
+    private fun isChatNavigationOnlyCommand(normalized: String): Boolean {
+        val compact =
+                normalized
+                        .replace(Regex("\\b(?:please|just|now)\\b"), " ")
+                        .replace(Regex("\\s+"), " ")
+                        .trim()
+        if (compact.isBlank()) return false
+        return Regex(
+                        "^(?:go|open|navigate(?: to)?|switch(?: to)?)\\s+(?:the\\s+)?(?:chat|conversation)(?:\\s+(?:page|view))?$"
+                )
+                        .matches(compact) ||
+                Regex("^(?:chat|conversation)(?:\\s+(?:page|view))?$").matches(compact)
     }
 
     private fun executeConversationFromDecision(
@@ -3001,6 +3157,26 @@ class MainActivity :
             )
             return
         }
+        val directAgentId = targetAgentId.trim()
+        if (directAgentId.isNotEmpty()) {
+            val combinedCandidates =
+                    if (cachedChatAgents.isNotEmpty() || lastKnownChatAgents.isNotEmpty()) {
+                        (cachedChatAgents + lastKnownChatAgents).distinctBy {
+                            "${it.id.orEmpty()}|${it.name.lowercase(Locale.US)}"
+                        }
+                    } else {
+                        emptyList()
+                    }
+            val fallbackByCache = findAgentById(combinedCandidates, directAgentId)
+            val fallbackName = fallbackByCache?.name.orEmpty()
+            dualWebViewGroup.showToast("Agent cache miss. Trying direct selector ID.", 1800L)
+            executeChatVoiceCommand(
+                    ChatAgent(id = directAgentId, name = fallbackName, description = ""),
+                    message,
+                    generation
+            )
+            return
+        }
         dualWebViewGroup.showToast("Agent not matched, sending in current chat.", 1800L)
         executeChatFillAndSend(message, generation)
     }
@@ -3034,6 +3210,63 @@ class MainActivity :
     ): DashboardCandidate? {
         if (dashboardId.isNullOrBlank()) return null
         return candidates.firstOrNull { it.dashboardId.equals(dashboardId.trim(), ignoreCase = true) }
+    }
+
+    private fun isDashboardDetailUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val path = runCatching { Uri.parse(url).path.orEmpty() }.getOrElse { return false }
+        return Regex("^/cognition/libraries/[^/]+/dashboards/[^/]+/?$", RegexOption.IGNORE_CASE)
+                .containsMatchIn(path)
+    }
+
+    private fun scrollDashboardGridstackToTop(targetWebView: WebView?) {
+        if (targetWebView == null) return
+        val currentUrl = targetWebView.url.orEmpty()
+        DebugLog.alwaysI("VoiceRouting", "dashboard-scroll start url=${currentUrl.take(220)}")
+        val js =
+                """
+            (function() {
+              var maxTries = 16;
+              var delayMs = 120;
+              var tries = 0;
+              function apply() {
+                var els = Array.from(document.querySelectorAll('.main-container'));
+                if (els.length) {
+                  els.forEach(function(el){
+                    try {
+                      el.scrollTo({ top: 200, left: 0, behavior: 'auto' });
+                    } catch (e) {
+                      el.scrollLeft = 0;
+                      el.scrollTop = 240;
+                    }
+                  });
+                  return 'ok';
+                }
+                tries += 1;
+                if (tries >= maxTries) return 'missing-main-container';
+                setTimeout(apply, delayMs);
+                return 'retrying';
+              }
+              return apply();
+            })();
+        """.trimIndent()
+        targetWebView.evaluateJavascript(js) { result ->
+            DebugLog.alwaysI("VoiceRouting", "dashboard-scroll result=${result.orEmpty()}")
+        }
+    }
+
+    private fun scheduleDashboardDetailScrollTop(targetWebView: WebView?) {
+        if (targetWebView == null) return
+        val delays = longArrayOf(600L)
+        delays.forEach { delay ->
+            targetWebView.postDelayed(
+                    {
+                        DebugLog.alwaysI("VoiceRouting", "dashboard-scroll scheduled delayMs=$delay")
+                        scrollDashboardGridstackToTop(targetWebView)
+                    },
+                    delay
+            )
+        }
     }
 
     private fun normalizeVoiceText(text: String): String {
@@ -3206,18 +3439,18 @@ class MainActivity :
                             out.take(8).joinToString(", ") { a ->
                                 "${a.id ?: "?"}:${a.name.trim().take(40)}"
                             }
-                    DebugLog.i(
+                    DebugLog.alwaysI(
                             "ChatAgents",
                             "agents cached count=${out.size} preview=[$preview${if (out.size > 8) ", …" else ""}]"
                     )
                 } else {
                     if (cachedChatAgents.isEmpty()) {
-                        DebugLog.i(
+                        DebugLog.alwaysI(
                                 "ChatAgents",
                                 "cacheChatAgentsFromJs empty; no prior cache (voice routing has no agent list yet)"
                         )
                     } else {
-                        DebugLog.d(
+                        DebugLog.alwaysI(
                                 "ChatAgents",
                                 "cacheChatAgentsFromJs scrape empty; keeping prior cache count=${cachedChatAgents.size}"
                         )
@@ -3226,7 +3459,7 @@ class MainActivity :
                 if (out.isNotEmpty()) {
                     cachedChatAgentsAt = SystemClock.elapsedRealtime()
                 }
-                DebugLog.i("ChatAgents", "cacheChatAgentsFromJs size=${out.size}")
+                DebugLog.alwaysI("ChatAgents", "cacheChatAgentsFromJs size=${out.size}")
             } catch (e: Exception) {
                 agentsCacheRefreshInFlight = false
                 DebugLog.e("ChatAgents", "cacheChatAgentsFromJs", e)
@@ -3262,18 +3495,18 @@ class MainActivity :
                             out.take(8).joinToString(", ") { d ->
                                 "${d.dashboardId}:${d.title.trim().take(40)}"
                             }
-                    DebugLog.i(
+                    DebugLog.alwaysI(
                             "Dashboards",
                             "dashboards cached count=${out.size} preview=[$preview${if (out.size > 8) ", …" else ""}]"
                     )
                 } else {
                     if (cachedDashboards.isEmpty()) {
-                        DebugLog.i(
+                        DebugLog.alwaysI(
                                 "Dashboards",
                                 "cacheDashboardsFromJs empty; no prior cache (voice routing has no dashboard list yet)"
                         )
                     } else {
-                        DebugLog.d(
+                        DebugLog.alwaysI(
                                 "Dashboards",
                                 "cacheDashboardsFromJs scrape empty; keeping prior cache count=${cachedDashboards.size}"
                         )
@@ -3282,7 +3515,7 @@ class MainActivity :
                 if (out.isNotEmpty()) {
                     cachedDashboardsAt = SystemClock.elapsedRealtime()
                 }
-                DebugLog.i("Dashboards", "cacheDashboardsFromJs size=${out.size}")
+                DebugLog.alwaysI("Dashboards", "cacheDashboardsFromJs size=${out.size}")
             } catch (e: Exception) {
                 dashboardCacheRefreshInFlight = false
                 DebugLog.e("Dashboards", "cacheDashboardsFromJs", e)
@@ -3434,7 +3667,7 @@ class MainActivity :
         webView.postDelayed(
                 {
                     if (cachedDashboards.isEmpty()) {
-                        DebugLog.i("Dashboards", "dashboard cache retry attempt=${attempt + 1}")
+                        DebugLog.alwaysI("Dashboards", "dashboard cache retry attempt=${attempt + 1}")
                         scheduleDashboardCacheRefresh(attempt + 1)
                     } else {
                         dashboardCacheRefreshInFlight = false
@@ -3467,7 +3700,7 @@ class MainActivity :
         webView.postDelayed(
                 {
                     if (cachedChatAgents.isEmpty()) {
-                        DebugLog.i("ChatAgents", "agents cache retry attempt=${attempt + 1}")
+                        DebugLog.alwaysI("ChatAgents", "agents cache retry attempt=${attempt + 1}")
                         scheduleAgentsCacheRefresh(attempt + 1)
                     } else {
                         agentsCacheRefreshInFlight = false
@@ -3576,6 +3809,9 @@ class MainActivity :
             ) {
                 pendingConversationNavigationComplete = onInPageRouted
             }
+            if (isDashboardDetailUrl(routeUrl) && onInPageRouted != null) {
+                pendingDashboardDetailNavigationComplete = onInPageRouted
+            }
             webView.loadUrl(routeUrl)
             return
         }
@@ -3589,6 +3825,9 @@ class MainActivity :
                             onInPageRouted != null
             ) {
                 pendingConversationNavigationComplete = onInPageRouted
+            }
+            if (isDashboardDetailUrl(routeUrl) && onInPageRouted != null) {
+                pendingDashboardDetailNavigationComplete = onInPageRouted
             }
             webView.loadUrl(routeUrl)
             return
@@ -3624,11 +3863,17 @@ class MainActivity :
                     result?.contains("in-page") == true || result?.contains("already-there") == true
             if (routedInPage) {
                 onInPageRouted?.let { cb -> webView.postDelayed(cb, 350L) }
+                if (isDashboardDetailUrl(routeUrl)) {
+                    scheduleDashboardDetailScrollTop(webView)
+                }
             } else {
                 if (routeUrl.startsWith(conversationRouteUrl, ignoreCase = true) &&
                                 onInPageRouted != null
                 ) {
                     pendingConversationNavigationComplete = onInPageRouted
+                }
+                if (isDashboardDetailUrl(routeUrl) && onInPageRouted != null) {
+                    pendingDashboardDetailNavigationComplete = onInPageRouted
                 }
                 webView.loadUrl(routeUrl)
             }
@@ -5262,6 +5507,13 @@ class MainActivity :
                                     injectDashboardScraper(view)
                                     scheduleDashboardCacheRefresh(0)
                                 }
+                                if (isDashboardDetailUrl(url)) {
+                                    scheduleDashboardDetailScrollTop(view)
+                                    pendingDashboardDetailNavigationComplete?.let { cb ->
+                                        pendingDashboardDetailNavigationComplete = null
+                                        webView.postDelayed(cb, 420L)
+                                    }
+                                }
 
                                 // Re-apply saved font settings to new page
                                 dualWebViewGroup.reapplyWebFontSettings()
@@ -5754,8 +6006,21 @@ class MainActivity :
 
     private fun findAgentById(candidates: List<ChatAgent>, agentId: String?): ChatAgent? {
         if (agentId.isNullOrBlank()) return null
-        val want = agentId.trim()
-        return candidates.firstOrNull { it.id.equals(want, ignoreCase = true) }
+        val wantRaw = agentId.trim()
+        val wantNorm = normalizeAgentIdForMatch(wantRaw)
+        return candidates.firstOrNull { agent ->
+            val idRaw = agent.id.orEmpty().trim()
+            if (idRaw.equals(wantRaw, ignoreCase = true)) return@firstOrNull true
+            val idNorm = normalizeAgentIdForMatch(idRaw)
+            idNorm.isNotEmpty() &&
+                    (idNorm == wantNorm ||
+                            idNorm.endsWith(wantNorm) ||
+                            wantNorm.endsWith(idNorm))
+        }
+    }
+
+    private fun normalizeAgentIdForMatch(value: String): String {
+        return value.lowercase(Locale.US).replace(Regex("[^a-z0-9_-]"), "")
     }
 
     private fun evaluateConversationChatJs(
@@ -5878,7 +6143,13 @@ class MainActivity :
         evaluateConversationChatJs(webView, js, generation)
     }
 
-    private fun executeChatVoiceCommand(agent: ChatAgent, message: String, generation: Long) {
+    private fun executeChatVoiceCommand(
+            agent: ChatAgent,
+            message: String,
+            generation: Long,
+            attempt: Int = 0
+    ) {
+        if (generation != chatVoicePipelineGeneration) return
         val qAgent = JSONObject.quote(agent.name)
         val qAgentId = JSONObject.quote(agent.id ?: "")
         val qMsg = JSONObject.quote(message)
@@ -5900,28 +6171,48 @@ class MainActivity :
                   return (s || '').toLowerCase().trim();
                 }
               }
-              function pickAgent(cb) {
-                var trig = document.querySelector('#chat-agent-select-trigger');
-                if (!trig) { cb(false); return; }
-                trig.click();
-                setTimeout(function() {
-                  var opts = document.querySelectorAll('.chat-agent-option');
-                  var hit = null;
-                  if (targetAgentId) {
-                    hit = Array.from(opts).find(function(o) {
-                      return ((o.getAttribute('data-agent-id') || '').trim() === targetAgentId);
-                    });
+              function hasAgentTarget() {
+                return !!((targetAgentId || '').trim() || norm(targetAgent));
+              }
+              function normId(v) {
+                return String(v || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+              }
+              function findMatchingOption() {
+                var opts = Array.from(document.querySelectorAll(
+                  '.chat-agent-option, [data-agent-id], [role="option"], [id*="agent"]'
+                ));
+                if (!opts.length) return null;
+                var hit = null;
+                var wantedId = normId(targetAgentId || '');
+                if (wantedId) {
+                  hit = opts.find(function(o) {
+                    var candidateId = normId(
+                      o.getAttribute('data-agent-id') ||
+                      o.dataset && o.dataset.agentId ||
+                      o.getAttribute('id') ||
+                      ''
+                    );
+                    return !!candidateId &&
+                      (candidateId === wantedId ||
+                       candidateId.endsWith(wantedId) ||
+                       wantedId.endsWith(candidateId));
+                  }) || null;
+                }
+                if (!hit) {
+                  var want = norm(targetAgent);
+                  if (want) {
+                    hit = opts.find(function(o) {
+                      var txt = norm(
+                        o.getAttribute('data-agent-name') ||
+                        o.innerText ||
+                        o.textContent ||
+                        ''
+                      );
+                      return txt.indexOf(want) >= 0 || want.indexOf(txt) >= 0;
+                    }) || null;
                   }
-                  if (!hit) {
-                    var want = norm(targetAgent);
-                    hit = Array.from(opts).find(function(o) {
-                      return norm(o.innerText).indexOf(want) >= 0 || want.indexOf(norm(o.innerText)) >= 0;
-                    });
-                  }
-                  if (hit) { hit.click(); cb(true); return; }
-                  try { document.body.click(); } catch (e) {}
-                  cb(false);
-                }, 200);
+                }
+                return hit;
               }
               function fillAndSend() {
                 var ta = document.querySelector('#chat-message-textarea');
@@ -5982,16 +6273,64 @@ class MainActivity :
                 try { obs.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
                 setTimeout(function(){ if (!done) obs.disconnect(); }, 20000);
               }
-              pickAgent(function() {
-                var r = fillAndSend();
-                if (r !== 'ok') {
-                  setTimeout(function() { fillAndSend(); }, 600);
+              if (hasAgentTarget()) {
+                var hit = findMatchingOption();
+                if (!hit) {
+                  var trig = document.querySelector('#chat-agent-select-trigger');
+                  if (!trig) return 'selector-unavailable';
+                  try { trig.click(); } catch (e) {}
+                  return 'opened-selector';
                 }
-              });
-              return 'started';
+                try { hit.click(); } catch (e) { return 'agent-click-failed'; }
+              }
+              return fillAndSend();
             })();
         """.trimIndent()
-        evaluateConversationChatJs(webView, js, generation)
+        val targetWebView = webView
+        targetWebView.evaluateJavascript(js) { result ->
+            if (generation != chatVoicePipelineGeneration) return@evaluateJavascript
+            val status =
+                    result
+                            ?.trim()
+                            .orEmpty()
+                            .removePrefix("\"")
+                            .removeSuffix("\"")
+                            .lowercase(Locale.US)
+            DebugLog.alwaysI(
+                    "VoiceRouting",
+                    "chat-switch attempt=$attempt status=$status agentId=${agent.id.orEmpty()} agentName=\"${agent.name.take(80)}\""
+            )
+            if (status == "ok") return@evaluateJavascript
+            val shouldRetry =
+                    status in
+                            setOf(
+                                    "opened-selector",
+                                    "selector-unavailable",
+                                    "agent-click-failed",
+                                    "missing-chat-input",
+                                    "missing-send",
+                                    "send-failed"
+                            )
+            if (shouldRetry && attempt < 8) {
+                val delay = if (attempt < 3) 280L else 480L
+                targetWebView.postDelayed(
+                        {
+                            executeChatVoiceCommand(
+                                    agent = agent,
+                                    message = message,
+                                    generation = generation,
+                                    attempt = attempt + 1
+                            )
+                        },
+                        delay
+                )
+                return@evaluateJavascript
+            }
+            if (status != "ok") {
+                dualWebViewGroup.showToast("Agent switch not confirmed. Sending message anyway.", 1800L)
+                executeChatFillAndSend(message, generation)
+            }
+        }
     }
 
     private fun createCameraIntent(): Intent? {

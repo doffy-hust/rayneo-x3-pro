@@ -36,7 +36,14 @@ object RoutingDecisionValidator {
         if (clamped.action == RoutingAction.NO_OP) {
             return RoutingValidationResult(true, clamped.copy(routeTarget = RouteTarget.NONE))
         }
-        return RoutingValidationResult(true, clamped.copy(message = clamped.message.trim()))
+        val sanitizedMessage =
+                when (clamped.action) {
+                    RoutingAction.CHAT_IN_CURRENT_CONVERSATION,
+                    RoutingAction.CHAT_WITH_AGENT_SWITCH ->
+                            clamped.message.trim().replace(Regex("\\s+"), " ")
+                    else -> clamped.message.trim()
+                }
+        return RoutingValidationResult(true, clamped.copy(message = sanitizedMessage))
     }
 
     private fun reject(decision: RoutingDecision, reason: String): RoutingValidationResult {
