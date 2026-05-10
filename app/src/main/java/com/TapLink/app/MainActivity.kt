@@ -2996,7 +2996,8 @@ class MainActivity :
                 executeConversationFromDecision(
                         message = message,
                         targetAgentId = decision.agentId,
-                        alreadyOnChat = alreadyOnChat
+                        alreadyOnChat = alreadyOnChat,
+                        forceNavigateFirst = true
                 )
                 if (decision.agentId.isNullOrBlank()) {
                     dualWebViewGroup.showToast("Agent not specified. Sending in current chat.", 1800L)
@@ -3100,11 +3101,12 @@ class MainActivity :
     private fun executeConversationFromDecision(
             message: String,
             targetAgentId: String?,
-            alreadyOnChat: Boolean
+            alreadyOnChat: Boolean,
+            forceNavigateFirst: Boolean = false
     ) {
         chatVoicePipelineGeneration += 1L
         val generation = chatVoicePipelineGeneration
-        if (!alreadyOnChat) {
+        if (forceNavigateFirst || !alreadyOnChat) {
             navigateRouteWithoutReload(conversationRouteUrl) {
                 scheduleConversationSendFromDecision(
                         generation = generation,
