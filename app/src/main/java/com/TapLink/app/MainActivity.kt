@@ -2879,6 +2879,9 @@ class MainActivity :
                             (normalizedLower.contains("agent") ||
                                     normalizedLower.contains("assistant") ||
                                     normalizedLower.contains("assistance") ||
+                                    normalizedLower.contains("digital employ") ||
+                                    normalizedLower.contains("digital employee") ||
+                                    normalizedLower.contains("nhan su so") ||
                                     normalizedLower.contains("tro ly"))
             ) {
                 DebugLog.alwaysI("VoiceRouting", "NO_OP fallback -> NAVIGATE_AGENT_LIST")

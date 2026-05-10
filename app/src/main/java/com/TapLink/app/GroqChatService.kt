@@ -190,6 +190,7 @@ class GroqChatService(private val groqAudioService: GroqAudioService) {
                         "Use dashboard_id only from dashboards[].dashboard_id. Use agent_id only from agents[].id. Never invent ids. " +
                         "For explicit list navigation requests, always return list actions even when candidates are empty: " +
                         "dashboard list command => NAVIGATE_DASHBOARD_LIST; agents list command => NAVIGATE_AGENT_LIST. " +
+                        "Treat these terms as agent-list intent synonyms: agent, assistant, assistance, digital employ, digital employee. " +
                         "For dashboard detail use dashboard_id when user asks open/detail a specific dashboard. " +
                         "For agent detail use agent_id when user asks open/detail a specific agent. " +
                         "Detail actions require IDs. If ID cannot be resolved for detail actions, return NO_OP. " +
